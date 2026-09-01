@@ -1,0 +1,1722 @@
+#!/usr/bin/env node
+// steam-video-downloader.mjs
+// Steam 游戏视频批量下载 + 剪辑拼接工具（网页版，零 npm 依赖，m3u8 能力完全内置）。
+//
+// 功能：
+//   网页输入框里可以一次粘贴多个 Steam 商店链接（每行一个），自动识别每个链接的 appid，
+//   逐个调用 Steam appdetails 接口拿到每个游戏的宣传视频列表，把"第一个视频"下载到本地。
+//   Steam 现在只提供 HLS(.m3u8)/DASH(.mpd) 流地址：
+//     - 解析 + 分片下载：Node 内置实现（信任系统证书，可正常访问 Steam 视频 CDN）
+//     - 合并成 mp4：使用内置 ffmpeg（工具目录 bin/，或自动探测本机 ffmpeg）
+//   无需安装/配置任何外部 m3u8 解析器。
+//   另外内置"剪辑拼接成片"：为素材填起止时间，流拷贝无损剪辑拼接输出成品。
+//
+// 输出命名：<当天日期>_<游戏名>_视频素材.mp4（例如 2026-09-01_Palworld_视频素材.mp4）
+// 默认保存目录：E:\worddeepseek\videocut\material（网页里可改）
+// 默认成品目录：E:\worddeepseek\videocut\product（网页里可改）
+//
+// 用法：
+//   node steam-video-downloader.mjs                        -> 启动本地网页 http://localhost:8898
+//   node steam-video-downloader.mjs --test                 -> 网络自检
+//
+// 脚本会自动以 --use-system-ca 重启自身，以信任 Windows 系统证书库，
+// 解决网络中间人导致的 "unable to verify the first certificate" 报错。
+// 若仍失败可加 --insecure 跳过校验（不安全）。想关闭自动重启可设 STEAM_NO_RELAUNCH=1。
+//
+// 代理：脚本默认读取环境变量 HTTPS_PROXY / HTTP_PROXY / ALL_PROXY；
+//       也可临时加参数 --proxy=http://127.0.0.1:7890（支持 http/https/socks5）。
+//
+// 可选环境变量：
+//   PORT          网页端口（默认 8898）
+//   VIDEO_DIR     视频默认保存目录（默认 E:/worddeepseek/videocut/material，网页里也可改）
+//   FFMPEG_PATH   ffmpeg 可执行文件路径（默认优先使用工具自带 bin/，其次系统安装）
+
+import { createServer } from 'node:http';
+import http from 'node:http';
+import https from 'node:https';
+import net from 'node:net';
+import tls from 'node:tls';
+import dns from 'node:dns';
+import { spawn } from 'node:child_process';
+import path from 'node:path';
+import fs from 'node:fs';
+import { randomUUID } from 'node:crypto';
+import { fileURLToPath } from 'node:url';
+
+// 脚本所在目录（内置 bin/ffmpeg.exe 从这里解析）。
+const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
+
+// 部分网络环境下 IPv6 解析失败会在连接层报 "fetch failed"，这里优先用 IPv4。
+dns.setDefaultResultOrder('ipv4first');
+
+// --insecure：跳过 TLS 证书校验（不安全，仅在确认网络中间人可信、且 --use-system-ca 仍无效时使用）。
+const INSECURE = process.argv.includes('--insecure');
+if (INSECURE) {
+  process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
+  console.error('⚠️  已开启 --insecure：跳过 TLS 证书校验（连接不再验证服务器身份，不安全）。');
+}
+
+const PORT = Number(process.env.PORT || 8898);
+const LANG = process.env.STEAM_LANG || 'schinese';
+const CC = process.env.STEAM_CC || 'cn';
+// 默认保存目录：素材统一放这里，方便后续合并成片。
+const DEFAULT_DIR = process.env.VIDEO_DIR || 'E:/worddeepseek/videocut/material';
+const UA =
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+
+// ── 小工具 ───────────────────────────────────────────────────────────────────
+
+// 从用户输入里提取 appid：支持完整商店链接、/agecheck/ 链接、以及纯数字。
+function extractAppId(input) {
+  const s = String(input ?? '').trim();
+  const m = s.match(/app\/(\d+)/i);
+  if (m) return m[1];
+  if (/^\d{1,10}$/.test(s)) return s;
+  return null;
+}
+
+// 文件名安全化：去掉 Windows 非法字符，空白转下划线。
+function sanitizeName(s) {
+  return String(s ?? '')
+    .replace(/[\\/:*?"<>|]/g, '_')
+    .replace(/\s+/g, '_')
+    .replace(/_+/g, '_')
+    .replace(/^_+|_+$/g, '')
+    .trim() || '未命名游戏';
+}
+
+// 当天日期（本地时间）：yyyy-MM-dd
+function todayStr() {
+  const d = new Date();
+  const p = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+}
+
+// 若目标已存在则加 _2/_3 序号，保证不覆盖。
+function uniquePath(p) {
+  if (!fs.existsSync(p)) return p;
+  const ext = path.extname(p);
+  const base = p.slice(0, -ext.length) || p;
+  for (let i = 2; i < 100; i++) {
+    const c = `${base}_${i}${ext}`;
+    if (!fs.existsSync(c)) return c;
+  }
+  return `${base}_${Date.now()}${ext}`;
+}
+
+// ── 网络层：支持代理（HTTP/HTTPS/SOCKS5）+ 更清晰的错误 ──────────────────────
+
+// 从命令行 --proxy= 或常见环境变量读取代理地址。
+function resolveProxy() {
+  const flag = process.argv.find((a) => a.startsWith('--proxy='));
+  if (flag) return flag.slice('--proxy='.length).trim();
+  return (
+    process.env.HTTPS_PROXY || process.env.https_proxy ||
+    process.env.HTTP_PROXY || process.env.http_proxy ||
+    process.env.ALL_PROXY || process.env.all_proxy ||
+    null
+  );
+}
+
+// 解析代理地址，识别 http/https/socks5 三种。
+function parseProxy(raw) {
+  if (!raw) return null;
+  let s = String(raw).trim();
+  if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(s)) s = 'http://' + s;
+  const u = new URL(s);
+  const proto = u.protocol.replace(':', '');
+  if (!['http:', 'https:', 'socks5:', 'socks5h:'].includes(u.protocol)) {
+    throw new Error(`不支持的代理协议：${u.protocol}（仅支持 http/https/socks5）`);
+  }
+  const kind = proto.startsWith('socks') ? 'socks5' : proto;
+  const port = Number(u.port || (proto === 'https:' ? 443 : proto === 'http:' ? 80 : 1080));
+  return {
+    kind,
+    host: u.hostname,
+    port,
+    auth: u.username ? `${decodeURIComponent(u.username)}:${decodeURIComponent(u.password)}` : null,
+  };
+}
+
+// 建立到目标主机的隧道（HTTP CONNECT 或 SOCKS5），返回已就绪的裸 socket。
+function openTunnel(proxy, targetHost, targetPort) {
+  return new Promise((resolve, reject) => {
+    if (proxy.kind === 'socks5') {
+      const sock = net.connect(proxy.port, proxy.host);
+      let stage = 0;
+      let buf = Buffer.alloc(0);
+      const onData = (chunk) => {
+        buf = Buffer.concat([buf, chunk]);
+        if (stage === 0) {
+          if (buf.length < 2) return;
+          if (buf[1] !== 0x00) { sock.destroy(); return reject(new Error('SOCKS5 代理需要认证，暂不支持带密码的 SOCKS5')); }
+          buf = buf.subarray(2);
+          stage = 1;
+          const hostBuf = Buffer.from(targetHost, 'utf8');
+          sock.write(Buffer.concat([
+            Buffer.from([0x05, 0x01, 0x00, 0x03, hostBuf.length]),
+            hostBuf,
+            Buffer.from([(targetPort >> 8) & 0xff, targetPort & 0xff]),
+          ]));
+        } else if (stage === 1) {
+          if (buf.length < 4) return;
+          const rep = buf[1];
+          const atyp = buf[3];
+          let headerLen = 4;
+          if (atyp === 0x01) headerLen = 10;
+          else if (atyp === 0x04) headerLen = 22;
+          else if (atyp === 0x03) headerLen = 5 + buf[4];
+          else { sock.destroy(); return reject(new Error('SOCKS5 响应异常')); }
+          if (buf.length < headerLen) return;
+          if (rep !== 0x00) { sock.destroy(); return reject(new Error(`SOCKS5 连接失败（响应码 ${rep}）`)); }
+          sock.off('data', onData);
+          resolve(sock);
+        }
+      };
+      sock.on('data', onData);
+      sock.once('error', reject);
+      sock.once('connect', () => sock.write(Buffer.from([0x05, 0x01, 0x00])));
+    } else {
+      const raw = proxy.kind === 'https'
+        ? tls.connect({ host: proxy.host, port: proxy.port, servername: proxy.host })
+        : net.connect(proxy.port, proxy.host);
+      const sendConnect = () => {
+        const authLine = proxy.auth
+          ? `Proxy-Authorization: Basic ${Buffer.from(proxy.auth).toString('base64')}\r\n`
+          : '';
+        raw.write(`CONNECT ${targetHost}:${targetPort} HTTP/1.1\r\nHost: ${targetHost}:${targetPort}\r\n${authLine}\r\n`);
+      };
+      if (proxy.kind === 'https') raw.once('secureConnect', sendConnect);
+      else raw.once('connect', sendConnect);
+      let buf = '';
+      const onData = (chunk) => {
+        buf += chunk.toString('latin1');
+        const idx = buf.indexOf('\r\n\r\n');
+        if (idx === -1) return;
+        const statusLine = (buf.slice(0, idx).split('\r\n')[0] || '').trim();
+        const m = / (\d{3})(?: |$)/.exec(statusLine);
+        if (!m || m[1] !== '200') {
+          raw.destroy();
+          return reject(new Error(`代理 CONNECT 失败：${statusLine}`));
+        }
+        raw.off('data', onData);
+        resolve(raw);
+      };
+      raw.on('data', onData);
+      raw.once('error', reject);
+    }
+  });
+}
+
+// 通过隧道为 HTTPS 目标建立一个 https.Agent。
+function makeProxyAgent(proxy) {
+  return new https.Agent({
+    keepAlive: true,
+    createConnection(options, cb) {
+      openTunnel(proxy, options.host, options.port || 443)
+        .then((tunnel) => {
+          const tlsSock = tls.connect({ socket: tunnel, servername: options.host });
+          tlsSock.once('secureConnect', () => cb(null, tlsSock));
+          tlsSock.once('error', cb);
+        })
+        .catch(cb);
+    },
+  });
+}
+
+// 通用 HTTPS 请求：支持 GET/POST、JSON body、自定义头、代理、超时、二进制响应。
+function requestHttps(urlStr, { method = 'GET', headers = {}, body, proxy, timeoutMs = 30000, binary = false } = {}) {
+  const target = new URL(urlStr);
+  const allHeaders = { 'User-Agent': UA, ...headers };
+  let payload;
+  if (body !== undefined) {
+    payload = typeof body === 'string' ? body : JSON.stringify(body);
+    if (typeof body !== 'string') allHeaders['Content-Type'] = 'application/json';
+    allHeaders['Content-Length'] = Buffer.byteLength(payload);
+  }
+  return new Promise((resolve, reject) => {
+    const opts = { method, headers: allHeaders };
+    if (proxy) opts.agent = makeProxyAgent(proxy);
+    const req = https.request(target, opts, (res) => {
+      const chunks = [];
+      res.on('data', (c) => chunks.push(c));
+      res.on('end', () => {
+        const buf = Buffer.concat(chunks);
+        resolve({
+          status: res.statusCode,
+          headers: res.headers,
+          body: binary ? buf : buf.toString('utf8'),
+        });
+      });
+    });
+    req.on('error', reject);
+    req.setTimeout(timeoutMs, () => req.destroy(new Error(`连接超时（${Math.round(timeoutMs / 1000)} 秒）`)));
+    if (payload) req.write(payload);
+    req.end();
+  });
+}
+
+// 把底层错误描述得更清楚（区分 DNS / 连接 / 超时 / TLS）。
+function describeError(e) {
+  const cause = e?.cause?.message || e?.cause?.code || '';
+  const msg = e?.message || String(e);
+  const text = cause && cause !== msg ? `${msg}（原因：${cause}）` : msg;
+  if (/certificate|unable to verify|self[- ]signed|CERT_/i.test(text)) {
+    return `${text} —— 这是证书校验失败，先用 node --use-system-ca 运行；若仍失败再加 --insecure`;
+  }
+  return text;
+}
+
+// 通用 HTTP GET（自动跟随重定向、支持代理、可选二进制），返回 { status, body:Buffer, finalUrl }。
+// 说明：Steam 视频 CDN 对 .NET 的 TLS 栈不兼容（N_m3u8DL-CLI 直连失败），
+//       所以下载分片一律走 Node（系统证书 + 跟随重定向）。
+function fetchHttp(urlStr, { binary = false, timeoutMs = 60000 } = {}) {
+  return new Promise((resolve, reject) => {
+    const go = (u, redirects) => {
+      let target;
+      try { target = new URL(u); } catch (e) { return reject(new Error(`无效地址：${e.message}`)); }
+      const mod = target.protocol === 'http:' ? http : https;
+      const opts = { headers: { 'User-Agent': UA, Accept: '*/*' } };
+      const proxyRaw = resolveProxy();
+      const proxy = proxyRaw ? parseProxy(proxyRaw) : null;
+      if (proxy) opts.agent = makeProxyAgent(proxy);
+      const req = mod.get(target, opts, (res) => {
+        if ([301, 302, 303, 307, 308].includes(res.statusCode) && res.headers.location) {
+          res.resume();
+          if (redirects >= 5) return reject(new Error('重定向次数过多'));
+          return go(new URL(res.headers.location, target).toString(), redirects + 1);
+        }
+        if (res.statusCode !== 200) {
+          res.resume();
+          return reject(new Error(`HTTP ${res.statusCode}`));
+        }
+        const chunks = [];
+        res.on('data', (c) => chunks.push(c));
+        res.on('end', () => resolve({
+          status: res.statusCode,
+          body: Buffer.concat(chunks),
+          finalUrl: res.url || u,
+        }));
+      });
+      req.on('error', reject);
+      req.setTimeout(timeoutMs, () => req.destroy(new Error(`连接超时（${Math.round(timeoutMs / 1000)} 秒）`)));
+      req.end();
+    };
+    go(urlStr, 0);
+  });
+}
+
+// GET 文本（自动跟随重定向）。
+async function fetchText(urlStr, opts = {}) {
+  const r = await fetchHttp(urlStr, opts);
+  return { text: r.body.toString('utf8'), finalUrl: r.finalUrl };
+}
+
+// 调用 Steam appdetails 接口。
+async function fetchApp(appid) {
+  const url = `https://store.steampowered.com/api/appdetails?appids=${appid}&l=${LANG}&cc=${CC}`;
+  const proxyRaw = resolveProxy();
+  const proxy = proxyRaw ? parseProxy(proxyRaw) : null;
+  const res = await requestHttps(url, { proxy });
+  if (res.status !== 200) {
+    const err = new Error(`Steam API HTTP ${res.status}`);
+    err.status = res.status;
+    throw err;
+  }
+  let json;
+  try {
+    json = JSON.parse(res.body);
+  } catch {
+    throw new Error('Steam 返回的内容不是合法 JSON（可能是被代理/网络劫持的页面）');
+  }
+  const entry = json?.[appid];
+  if (!entry || entry.success !== true) return null;
+  return entry.data;
+}
+
+// 从一部电影里挑视频源。返回 { kind, url, label }：
+//   kind = 'direct' 旧接口的 mp4/webm 直链（走内置下载）
+//   kind = 'hls'    HLS 流（走 N_m3u8DL-CLI）
+//   kind = 'dash'   DASH 流（走 N_m3u8DL-CLI，尽力支持）
+function pickSource(movie, quality) {
+  const m4 = (movie && typeof movie.mp4 === 'object' && movie.mp4) || {};
+  const wb = (movie && typeof movie.webm === 'object' && movie.webm) || {};
+  // 1) 旧接口直链
+  const dkeys = quality === '480' ? ['480', 'sd', 'max', 'hd'] : ['max', 'hd', 'sd', '480'];
+  for (const k of dkeys) {
+    if (m4[k]) return { kind: 'direct', url: m4[k], label: `MP4 ${k === 'max' ? '最高' : k}` };
+  }
+  for (const k of dkeys) {
+    if (wb[k]) return { kind: 'direct', url: wb[k], label: `WebM ${k === 'max' ? '最高' : k}` };
+  }
+  // 2) 新接口流媒体（优先 HLS H.264，兼容性最好）
+  if (movie?.hls_h264) return { kind: 'hls', url: movie.hls_h264, label: 'HLS H.264' };
+  if (movie?.dash_h264) return { kind: 'dash', url: movie.dash_h264, label: 'DASH H.264' };
+  if (movie?.dash_av1) return { kind: 'dash', url: movie.dash_av1, label: 'DASH AV1' };
+  return null;
+}
+
+// ── 直链下载（旧接口 mp4/webm 用）────────────────────────────────────────────
+
+// 流式下载文件（自动跟随重定向、支持取消、回报进度）。
+function downloadFile(urlStr, destPath, { signal, onProgress, timeoutMs = 1800000 } = {}) {
+  return new Promise((resolve, reject) => {
+    let redirects = 0;
+    const part = destPath + '.part';
+    const cleanupPart = () => { try { fs.rmSync(part, { force: true }); } catch { /* 忽略 */ } };
+
+    const go = (u) => {
+      if (signal && signal.aborted) return reject(new Error('已取消'));
+      let target;
+      try { target = new URL(u); } catch (e) { return reject(new Error(`无效的下载地址：${e.message}`)); }
+
+      const opts = { method: 'GET', headers: { 'User-Agent': UA, Accept: '*/*' } };
+      const proxyRaw = resolveProxy();
+      const proxy = proxyRaw ? parseProxy(proxyRaw) : null;
+      if (proxy) opts.agent = makeProxyAgent(proxy);
+
+      const req = https.request(target, opts, (res) => {
+        if ([301, 302, 303, 307, 308].includes(res.statusCode) && res.headers.location) {
+          res.resume();
+          if (++redirects > 5) { req.destroy(); return reject(new Error('重定向次数过多')); }
+          return go(new URL(res.headers.location, target).toString());
+        }
+        if (res.statusCode !== 200) {
+          res.resume();
+          return reject(new Error(`HTTP ${res.statusCode}`));
+        }
+        const total = parseInt(String(res.headers['content-length'] || '0'), 10) || 0;
+        let received = 0;
+        const out = fs.createWriteStream(part);
+        const onAbort = () => { req.destroy(new Error('已取消')); };
+        if (signal) signal.addEventListener('abort', onAbort, { once: true });
+        out.on('error', (e) => { req.destroy(); reject(e); });
+        res.on('data', (c) => {
+          received += c.length;
+          if (onProgress) onProgress(received, total);
+        });
+        res.pipe(out);
+        out.on('finish', () => {
+          if (signal) signal.removeEventListener('abort', onAbort);
+          try {
+            if (fs.existsSync(destPath)) fs.rmSync(destPath, { force: true });
+            fs.renameSync(part, destPath);
+          } catch (e) {
+            cleanupPart();
+            return reject(new Error(`保存文件失败：${e.message}`));
+          }
+          resolve({ bytes: received, total });
+        });
+      });
+      req.on('error', (e) => {
+        cleanupPart();
+        reject(e);
+      });
+      req.setTimeout(timeoutMs, () => req.destroy(new Error('下载超时（30 分钟）')));
+      req.end();
+    };
+    go(urlStr);
+  });
+}
+
+// ── HLS 混合下载：Node 拉分片 -> 本地清单 -> ffmpeg 合并 ─────────────────────
+// 原因：Steam 视频 CDN 对 .NET TLS 栈不兼容（.NET 工具直连报"接收时发生错误"），
+//       而 Node（--use-system-ca）可正常访问。故下载阶段用 Node，合并阶段用 ffmpeg
+//       （工具自带 bin/，或自动探测系统安装）。全程无需外部 m3u8 解析器。
+
+// 相对引用解析。
+function resolveRef(base, ref) {
+  return new URL(ref, base).toString();
+}
+
+// 解析 m3u8：返回 { segs:[{uri}], map:{uri}|null, key:{uri}|null }。
+function parseM3u8(text) {
+  const lines = String(text).split(/\r?\n/);
+  const segs = [];
+  let map = null;
+  let key = null;
+  for (const l of lines) {
+    if (l.startsWith('#EXT-X-MAP')) {
+      const m = /URI="([^"]+)"/.exec(l);
+      if (m) map = { uri: m[1] };
+    } else if (l.startsWith('#EXT-X-KEY')) {
+      const m = /URI="([^"]+)"/.exec(l);
+      const method = /METHOD=([^,\s]+)/.exec(l);
+      if (m && method && /AES-128/i.test(method[1])) key = { uri: m[1] };
+    } else if (l.trim() && !l.startsWith('#')) {
+      segs.push({ uri: l.trim() });
+    }
+  }
+  return { segs, map, key };
+}
+
+// 把清单里的远程引用改写成本地文件名。
+function rewritePlaylist(text, base, localNames) {
+  return String(text).split(/\r?\n/).map((l) => {
+    if (l.startsWith('#EXT-X-MAP') || l.startsWith('#EXT-X-KEY')) {
+      const m = /URI="([^"]+)"/.exec(l);
+      if (m) {
+        const u = resolveRef(base, m[1]);
+        return l.replace(m[1], localNames[u] || m[1]);
+      }
+      return l;
+    }
+    if (l.trim() && !l.startsWith('#')) {
+      const u = resolveRef(base, l.trim());
+      return localNames[u] || l;
+    }
+    return l;
+  }).join('\n');
+}
+
+// 混合下载主函数：下载主清单 + 最优变体 + 音轨 + 全部分片到 workDir，
+// 改写成本地 video.m3u8 / audio.m3u8 / master.m3u8。
+// onProgress(done, total, bytes, secs) 回报进度。
+// resolve 返回 { masterPath, totalBytes }。
+async function downloadHlsToLocal(masterUrl, quality, workDir, onProgress) {
+  fs.mkdirSync(workDir, { recursive: true });
+  const master = await fetchText(masterUrl);
+  const mLines = master.text.split(/\r?\n/);
+
+  let audioUri = null;
+  const variants = [];
+  for (let i = 0; i < mLines.length; i++) {
+    const l = mLines[i];
+    if (l.startsWith('#EXT-X-MEDIA') && /TYPE=AUDIO/i.test(l)) {
+      const m = /URI="([^"]+)"/.exec(l);
+      if (m) audioUri = m[1];
+    } else if (l.startsWith('#EXT-X-STREAM-INF')) {
+      const next = (mLines[i + 1] || '').trim();
+      if (next && !next.startsWith('#')) {
+        const bw = Number((/BANDWIDTH=(\d+)/.exec(l) || [])[1] || 0);
+        const res = /RESOLUTION=(\d+)x(\d+)/.exec(l);
+        variants.push({ uri: next, bw, width: res ? Number(res[1]) : 0 });
+      }
+    }
+  }
+
+  // 选变体：max = 码率最高；480 = 最接近 854x480（无分辨率信息时按码率估算）。
+  let videoUri = null;
+  if (variants.length) {
+    if (quality === '480') {
+      variants.sort((a, b) =>
+        Math.abs((a.width || Math.sqrt(a.bw)) - 854) - Math.abs((b.width || Math.sqrt(b.bw)) - 854));
+    } else {
+      variants.sort((a, b) => b.bw - a.bw);
+    }
+    videoUri = variants[0].uri;
+  }
+
+  // 拉取子清单。
+  const vUrl = videoUri ? resolveRef(master.finalUrl || masterUrl, videoUri) : masterUrl;
+  const vRes = videoUri ? await fetchText(vUrl) : master;
+  const vp = parseM3u8(vRes.text);
+  let ap = null;
+  let aUrl = null;
+  if (audioUri) {
+    aUrl = resolveRef(master.finalUrl || masterUrl, audioUri);
+    ap = parseM3u8((await fetchText(aUrl)).text);
+  }
+
+  // 汇总需要下载的文件。
+  const files = [];
+  const push = (base, uri) => files.push({ base, uri });
+  for (const s of vp.segs) push(vUrl, s.uri);
+  if (vp.map) push(vUrl, vp.map.uri);
+  if (vp.key) push(vUrl, vp.key.uri);
+  if (ap) {
+    for (const s of ap.segs) push(aUrl, s.uri);
+    if (ap.map) push(aUrl, ap.map.uri);
+    if (ap.key) push(aUrl, ap.key.uri);
+  }
+  const total = files.length;
+  if (!total) throw new Error('播放清单里没有找到任何分片');
+
+  // 并发下载。
+  const localNames = {};
+  let done = 0;
+  let totalBytes = 0;
+  const t0 = Date.now();
+  const indexed = files.map((f, i) => ({ ...f, idx: i }));
+  await runPool(indexed, async (f) => {
+    const u = resolveRef(f.base, f.uri);
+    const r = await fetchHttp(u, { timeoutMs: 120000 });
+    // 用 .m4s 扩展名命名，保证 ffmpeg 的 hls 解复用器允许（hls.c 扩展名白名单）。
+    const name = `f_${String(f.idx).padStart(4, '0')}.m4s`;
+    localNames[u] = name;
+    fs.writeFileSync(path.join(workDir, name), r.body);
+    totalBytes += r.body.length;
+    done += 1;
+    if (onProgress) {
+      try { onProgress(done, total, totalBytes, (Date.now() - t0) / 1000); } catch { /* ignore */ }
+    }
+  }, 6);
+
+  // 写本地清单。
+  const videoLocal = rewritePlaylist(vRes.text, vUrl, localNames);
+  fs.writeFileSync(path.join(workDir, 'video.m3u8'), videoLocal);
+  if (ap) {
+    const audioLocal = rewritePlaylist((await fetchText(aUrl)).text, aUrl, localNames);
+    fs.writeFileSync(path.join(workDir, 'audio.m3u8'), audioLocal);
+  }
+  const sm = ['#EXTM3U', '#EXT-X-VERSION:7'];
+  if (ap) sm.push('#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="Default",AUTOSELECT=YES,DEFAULT=YES,URI="audio.m3u8"');
+  sm.push('#EXT-X-STREAM-INF:BANDWIDTH=5800000,CODECS="avc1.640029,mp4a.40.2",RESOLUTION=1920x1080' + (ap ? ',AUDIO="audio"' : ''));
+  sm.push('video.m3u8');
+  const masterLocal = path.join(workDir, 'master.m3u8');
+  fs.writeFileSync(masterLocal, sm.join('\n'));
+
+  return { masterPath: masterLocal, totalBytes };
+}
+
+// ── 本地 ffmpeg（合并/混流，纯本地文件，不涉及网络 TLS）──────────────────────
+
+// 查找 ffmpeg：内置 bin/ -> 环境变量 -> 系统安装 -> PATH。
+function resolveFfmpeg() {
+  const candidates = [
+    path.join(SCRIPT_DIR, 'bin', 'ffmpeg.exe'), // 工具自带（内置，开箱即用）
+    process.env.FFMPEG_PATH,
+    'C:/Users/chr/AppData/Local/Programs/ffmpeg/bin/ffmpeg.exe', // 本机系统安装
+    'ffmpeg',
+  ].filter(Boolean);
+  for (const c of candidates) {
+    try {
+      if (c === 'ffmpeg' || fs.existsSync(c)) return c;
+    } catch { /* ignore */ }
+  }
+  return null;
+}
+
+// 运行一个本地命令（不捕获输出，stdout/stderr 丢弃）。
+function runLocal(cmd, args, { timeoutMs = 600000 } = {}) {
+  return new Promise((resolve, reject) => {
+    let child;
+    try {
+      child = spawn(cmd, args, { stdio: ['ignore', 'ignore', 'ignore'], windowsHide: true });
+    } catch (e) {
+      return reject(new Error(`启动失败：${e.message}`));
+    }
+    const timer = setTimeout(() => { try { child.kill('SIGKILL'); } catch { /* ignore */ } }, timeoutMs);
+    child.on('error', (e) => { clearTimeout(timer); reject(new Error(`启动失败：${e.message}`)); });
+    child.on('close', (code) => {
+      clearTimeout(timer);
+      if (code === 0) resolve();
+      else reject(new Error(`退出码 ${code}`));
+    });
+  });
+}
+
+// 直接读本地 master.m3u8 合并（视频+音频一组出片）。
+async function mergeWithFfmpeg(masterPath, dest) {
+  const ff = resolveFfmpeg();
+  if (!ff) throw new Error('未找到 ffmpeg，无法合并');
+  await runLocal(ff, ['-y', '-allowed_extensions', 'ALL', '-i', masterPath, '-c', 'copy', '-bsf:a', 'aac_adtstoasc', dest]);
+}
+
+// ── 任务（Job）管理 ──────────────────────────────────────────────────────────
+
+const jobs = new Map(); // jobId -> job
+
+function createJob({ links, dir, skipExisting, quality }) {
+  const items = [];
+  const seen = new Set();
+  for (const raw of links) {
+    const line = String(raw ?? '').trim();
+    if (!line) continue;
+    const appid = extractAppId(line);
+    if (!appid) {
+      items.push({ link: line, appid: null, name: '', state: '无效链接', percent: 0, size: 0, speed: '', path: '', error: '无法识别 appid（需要商店链接或纯数字）' });
+      continue;
+    }
+    if (seen.has(appid)) continue; // 同一游戏去重
+    seen.add(appid);
+    items.push({
+      link: line, appid, name: '', state: '等待中',
+      percent: 0, size: 0, speed: '', path: '', error: '',
+      videoUrl: '', videoLabel: '', videoKind: '', log: [],
+    });
+  }
+  return {
+    id: randomUUID(),
+    dir,
+    skipExisting,
+    quality,
+    status: 'running', // running / done / canceled / error
+    error: '',
+    canceled: false,
+    aborts: new Set(),
+    childProcs: new Set(),
+    items,
+    startedAt: Date.now(),
+    finishedAt: null,
+    listeners: new Set(),
+    lastEmit: 0,
+  };
+}
+
+// 序列化视图（去掉 listeners 等运行时字段）。
+function jobView(job) {
+  return {
+    id: job.id,
+    dir: job.dir,
+    skipExisting: job.skipExisting,
+    quality: job.quality,
+    status: job.status,
+    error: job.error,
+    startedAt: job.startedAt,
+    finishedAt: job.finishedAt,
+    items: job.items.map((it) => ({ ...it, log: (it.log || []).slice(-6) })),
+  };
+}
+
+// 推送快照给所有 SSE 客户端；普通进度节流 250ms，状态变化强制推。
+function emitJob(job, force) {
+  const now = Date.now();
+  if (!force && now - job.lastEmit < 250) return;
+  job.lastEmit = now;
+  const data = JSON.stringify({ type: 'snapshot', job: jobView(job) });
+  for (const res of job.listeners) {
+    try { res.write(`data: ${data}\n\n`); } catch { /* 客户端可能已断开 */ }
+  }
+}
+
+// 简单的并发池：并发跑 items 里的每一项，每个项交给 worker。
+async function runPool(items, worker, concurrency) {
+  if (!items.length) return;
+  let idx = 0;
+  const runners = [];
+  const n = Math.max(1, Math.min(concurrency, items.length));
+  for (let i = 0; i < n; i++) {
+    runners.push((async () => {
+      while (idx < items.length) {
+        const cur = idx++;
+        await worker(items[cur]);
+      }
+    })());
+  }
+  await Promise.all(runners);
+}
+
+// 执行任务：阶段一拿游戏信息，阶段二下载视频。
+async function runJob(job) {
+  try {
+    const pending = job.items.filter((it) => it.appid);
+
+    // 阶段一：并发 3 获取游戏信息（名字 + 第一个视频地址）。
+    await runPool(pending, async (it) => {
+      if (job.canceled) { it.state = '已取消'; emitJob(job, true); return; }
+      it.state = '获取游戏信息';
+      emitJob(job, true);
+      try {
+        const data = await fetchApp(it.appid);
+        if (job.canceled) { it.state = '已取消'; emitJob(job, true); return; }
+        if (!data) {
+          it.state = '失败';
+          it.error = 'appdetails 未返回数据（可能不存在、地区受限或需年龄验证）';
+          emitJob(job, true);
+          return;
+        }
+        it.name = data.name || `App ${it.appid}`;
+        const movies = Array.isArray(data.movies) ? data.movies : [];
+        const movie = movies[0]; // 只取第一个视频
+        const src = movie ? pickSource(movie, job.quality) : null;
+        if (!src) {
+          it.state = '无视频';
+          it.error = '该游戏没有宣传视频';
+          emitJob(job, true);
+          return;
+        }
+        it.videoUrl = src.url;
+        it.videoLabel = src.label;
+        it.videoKind = src.kind;
+        it.state = '待下载';
+        emitJob(job, true);
+      } catch (e) {
+        it.state = '失败';
+        it.error = `获取信息失败：${describeError(e)}`;
+        emitJob(job, true);
+      }
+    }, 3);
+
+    // 阶段二：逐一下载（N_m3u8DL-CLI 本身多线程，串行执行避免网络挤占）。
+    const todo = pending.filter((it) => it.videoUrl);
+    await runPool(todo, async (it) => {
+      if (job.canceled) { it.state = '已取消'; emitJob(job, true); return; }
+      it.log = [];
+      const baseName = `${todayStr()}_${sanitizeName(it.name)}_视频素材`;
+      const ext = it.videoKind === 'direct' ? (/\.webm($|\?)/i.test(it.videoUrl) ? 'webm' : 'mp4') : 'mp4';
+      const expected = path.join(job.dir, `${baseName}.${ext}`);
+
+      if (job.skipExisting && fs.existsSync(expected)) {
+        const st = fs.statSync(expected);
+        it.state = '已存在';
+        it.path = expected;
+        it.size = st.size;
+        it.percent = 100;
+        emitJob(job, true);
+        return;
+      }
+
+      it.state = '下载中';
+      it.percent = 0;
+      it.speed = '';
+      it.size = 0;
+      it.path = '';
+      emitJob(job, true);
+
+      const ac = new AbortController();
+      job.aborts.add(ac);
+      const t0 = Date.now();
+      const onProgressTick = (got, total) => {
+        it.percent = total ? Math.round((got / total) * 100) : 0;
+        const secs = Math.max(0.1, (Date.now() - t0) / 1000);
+        it.speed = `${formatSize(got / secs)}/s`;
+        it.size = total || got;
+        emitJob(job, false);
+      };
+
+      try {
+        let finalPath = '';
+        if (it.videoKind === 'direct') {
+          // 旧接口直链：Node 直接下载。
+          const dest = uniquePath(expected);
+          await downloadFile(it.videoUrl, dest, { signal: ac.signal, onProgress: onProgressTick });
+          finalPath = dest;
+        } else if (it.videoKind === 'dash') {
+          it.state = '失败';
+          it.error = '该游戏仅提供 DASH 流（.mpd），当前版本暂不支持自动下载';
+          emitJob(job, true);
+          return;
+        } else {
+          // HLS：Node 下载分片 -> 本地清单 -> 内置 ffmpeg 合并（无需外部解析器）。
+          const tmpDir = path.join(job.dir, `_hls_${it.appid}_${Date.now()}`);
+          const masterLocal = path.join(tmpDir, 'master.m3u8');
+          try {
+            await downloadHlsToLocal(it.videoUrl, job.quality, tmpDir, (done, total, bytes, secs) => {
+              it.percent = total ? Math.round((done / total) * 100) : 0;
+              it.speed = `${formatSize(bytes / Math.max(0.1, secs))}/s`;
+              it.size = bytes;
+              it.log = [`正在下载分片 ${done}/${total}（视频+音轨）`];
+              emitJob(job, false);
+            });
+            it.percent = 90;
+            it.log = ['分片下载完成，正在合并成 mp4…'];
+            emitJob(job, false);
+            finalPath = uniquePath(expected);
+            await mergeWithFfmpeg(masterLocal, finalPath);
+          } finally {
+            try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch { /* ignore */ }
+          }
+        }
+        const st = fs.statSync(finalPath);
+        it.state = '完成';
+        it.percent = 100;
+        it.speed = '';
+        it.size = st.size;
+        it.path = finalPath;
+        emitJob(job, true);
+      } catch (e) {
+        if (ac.signal.aborted) {
+          it.state = '已取消';
+          it.error = '';
+        } else {
+          it.state = '失败';
+          it.error = `${it.videoKind === 'direct' ? '下载' : 'N_m3u8DL-CLI'}失败：${describeError(e)}`;
+        }
+        emitJob(job, true);
+      } finally {
+        job.aborts.delete(ac);
+      }
+    }, 1);
+
+    job.status = job.canceled ? 'canceled' : 'done';
+  } catch (e) {
+    job.status = 'error';
+    job.error = e.message;
+  }
+  job.finishedAt = Date.now();
+  emitJob(job, true);
+}
+
+function cancelJob(jobId) {
+  const job = jobs.get(jobId);
+  if (!job) return false;
+  job.canceled = true;
+  for (const ac of job.aborts) ac.abort();
+  for (const it of job.items) {
+    if (it.state === '等待中' || it.state === '待下载') it.state = '已取消';
+  }
+  emitJob(job, true);
+  return true;
+}
+
+// ── 文件工具 ─────────────────────────────────────────────────────────────────
+
+function formatSize(bytes) {
+  const n = Number(bytes) || 0;
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  if (n < 1024 * 1024 * 1024) return `${(n / 1024 / 1024).toFixed(1)} MB`;
+  return `${(n / 1024 / 1024 / 1024).toFixed(2)} GB`;
+}
+
+function listFiles(dir) {
+  let files = [];
+  try {
+    files = fs.readdirSync(dir)
+      .filter((f) => !f.endsWith('.part'))
+      .map((f) => {
+        const st = fs.statSync(path.join(dir, f));
+        return { name: f, size: st.size, mtime: st.mtimeMs, path: path.join(dir, f) };
+      })
+      .sort((a, b) => b.mtime - a.mtime);
+  } catch {
+    // 目录不存在或不可读时返回空列表
+  }
+  return files;
+}
+
+// ── 剪辑拼接（本地 ffmpeg：cut -> 统一 timescale -> concat 流拷贝）─────────────
+
+// 解析时间字符串为秒：支持 "90" / "1.5" / "1:30" / "1:30.5" / "01:02:03.4"；空返回 null。
+function parseTime(str) {
+  const s = String(str ?? '').trim();
+  if (!s) return null;
+  if (/^\d+(\.\d+)?$/.test(s)) return Number(s);
+  const m = /^(?:(\d+):)?(\d+):(\d+(?:\.\d+)?)$/.exec(s); // mm:ss 或 hh:mm:ss
+  if (m) {
+    const h = m[1] ? Number(m[1]) : 0;
+    const min = Number(m[2]);
+    const sec = Number(m[3]);
+    if (min >= 60 || sec >= 60) return null;
+    return h * 3600 + min * 60 + sec;
+  }
+  const m2 = /^(\d+):(\d+(?:\.\d+)?)$/.exec(s); // m:ss
+  if (m2) {
+    const min = Number(m2[1]);
+    const sec = Number(m2[2]);
+    if (sec >= 60) return null;
+    return min * 60 + sec;
+  }
+  return null;
+}
+
+// 把本地路径转成 ffmpeg concat 列表可用的形式（正斜杠 + 单引号转义）。
+function escapeConcatPath(p) {
+  const fwd = String(p).replace(/\\/g, '/');
+  return `'${fwd.replace(/'/g, `'\\''`)}'`;
+}
+
+// 从素材文件名解析游戏名：去掉 "日期_" 前缀与 "_视频素材" 后缀。
+// 例：2026-09-01_Palworld_幻兽帕鲁_视频素材.mp4 -> Palworld_幻兽帕鲁
+function parseGameNameFromFile(filename) {
+  let n = String(filename ?? '').replace(/\.[^.]+$/, '');
+  n = n.replace(/^\d{4}-\d{2}-\d{2}_?/, '');
+  n = n.replace(/_视频素材$/, '').replace(/_素材$/, '');
+  return n || path.basename(filename).replace(/\.[^.]+$/, '') || '素材';
+}
+
+// 剪辑拼接主流程（流拷贝、无损）：
+//   materials: [{ name, path, start, end }]（按数组顺序）
+//   outDir: 成品目录；outName: 成品名（不含扩展名，缺省自动 "日期_名称1_名称2…"）
+// 返回 { output, size, duration }。
+async function composeVideos(materials, outDir, outName) {
+  const ff = resolveFfmpeg();
+  if (!ff) throw new Error('未找到 ffmpeg，无法剪辑拼接');
+  const list = [];
+  for (const m of materials) {
+    const p = String(m.path || '').trim();
+    if (!p) throw new Error('存在未填写文件路径的素材项');
+    if (!fs.existsSync(p)) throw new Error(`素材文件不存在：${p}`);
+    const start = parseTime(m.start);
+    const end = parseTime(m.end);
+    if (start !== null && end !== null && end <= start) throw new Error(`时间段无效（结束需晚于开始）：${m.name || p}`);
+    list.push({ name: String(m.name || '').trim() || parseGameNameFromFile(path.basename(p)), path: p, start, end });
+  }
+
+  // 成品文件名
+  const dateStr = todayStr();
+  const baseName = (outName && String(outName).trim())
+    ? String(outName).trim()
+    : `${dateStr}_${list.map((x) => sanitizeName(x.name)).join('_')}`;
+  const dest = uniquePath(path.join(outDir, `${sanitizeName(baseName)}.mp4`));
+
+  // 临时目录：与成品同盘（避免跨盘 rename），隐藏目录，结束后删除
+  const tmpDir = path.join(outDir, `.compose_tmp_${Date.now()}`);
+  fs.mkdirSync(tmpDir, { recursive: true });
+
+  const normClips = [];
+  try {
+    for (let i = 0; i < list.length; i++) {
+      const it = list[i];
+      const clip = path.join(tmpDir, `clip${i + 1}.mp4`);
+      const norm = path.join(tmpDir, `norm${i + 1}.mp4`);
+      const args = ['-y', '-loglevel', 'error'];
+      if (it.start !== null) { args.push('-ss', String(it.start)); }
+      args.push('-i', it.path);
+      if (it.start !== null && it.end !== null) args.push('-t', String(it.end - it.start));
+      else if (it.end !== null) args.push('-to', String(it.end));
+      args.push('-c', 'copy', '-avoid_negative_ts', 'make_zero', clip);
+      await runLocal(ff, args, { timeoutMs: 300000 });
+      if (!fs.existsSync(clip)) throw new Error(`剪辑失败（未生成片段）：${it.name}`);
+      // 统一视频 timescale（不同帧率的流直接 concat 会导致时间戳错乱）
+      await runLocal(ff, ['-y', '-loglevel', 'error', '-i', clip, '-c', 'copy', '-video_track_timescale', '15360', norm], { timeoutMs: 300000 });
+      normClips.push(norm);
+    }
+    const listFile = path.join(tmpDir, 'list.txt');
+    const lines = normClips.map((c) => `file ${escapeConcatPath(c)}`);
+    fs.writeFileSync(listFile, lines.join('\n'), 'utf8'); // UTF-8 无 BOM，ffmpeg concat 才能识别
+    await runLocal(ff, ['-y', '-loglevel', 'error', '-f', 'concat', '-safe', '0', '-i', listFile, '-c', 'copy', dest], { timeoutMs: 600000 });
+    if (!fs.existsSync(dest)) throw new Error('拼接失败（未生成成品文件）');
+  } finally {
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch { /* ignore */ }
+  }
+
+  const st = fs.statSync(dest);
+  return { output: dest, size: st.size };
+}
+
+// GET /api/materials?dir=... ：列出素材目录的 mp4（附带解析出的游戏名）。
+function handleMaterials(urlObj, res) {
+  const dir = urlObj.searchParams.get('dir') || DEFAULT_DIR;
+  const files = listFiles(dir).filter((f) => /\.(mp4|webm|mkv|mov)$/i.test(f.name)).map((f) => ({
+    ...f,
+    gameName: parseGameNameFromFile(f.name),
+  }));
+  return json(res, 200, { dir, files });
+}
+
+// POST /api/compose ：剪辑拼接。
+async function handleCompose(req, res) {
+  let payload;
+  try {
+    payload = JSON.parse(await readBody(req));
+  } catch {
+    return json(res, 400, { error: '请求体不是合法 JSON' });
+  }
+  const materials = Array.isArray(payload.materials) ? payload.materials : [];
+  if (!materials.length) return json(res, 400, { error: '请至少选择一个素材' });
+  const outDir = String(payload.outDir || '').trim() || 'E:/worddeepseek/videocut/product';
+  try {
+    fs.mkdirSync(outDir, { recursive: true });
+  } catch (e) {
+    return json(res, 400, { error: `无法创建成品目录：${e.message}` });
+  }
+  try {
+    const r = await composeVideos(materials, outDir, payload.outName);
+    return json(res, 200, { ok: true, ...r });
+  } catch (e) {
+    return json(res, 502, { error: `剪辑拼接失败：${e.message}` });
+  }
+}
+
+// ── 网页界面 ─────────────────────────────────────────────────────────────────
+
+// 注意：用 String.raw 包裹；页面里的 JS 不要使用反引号模板字符串（避免提前截断）。
+const PAGE = String.raw`<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Steam 游戏视频批量下载</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; max-width: 980px; margin: 0 auto; padding: 24px; }
+  h1 { font-size: 22px; margin-bottom: 4px; }
+  .sub { color: #888; font-size: 13px; margin-bottom: 16px; line-height: 1.7; }
+  label { font-size: 13px; color: #777; display: block; margin: 12px 0 4px; }
+  textarea { width: 100%; box-sizing: border-box; min-height: 140px; padding: 10px 12px; font-size: 13px; font-family: Consolas, Menlo, monospace; border: 1px solid #888; border-radius: 6px; resize: vertical; }
+  .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; margin-top: 10px; }
+  input[type=text] { flex: 1; min-width: 240px; padding: 9px 12px; font-size: 13px; border: 1px solid #888; border-radius: 6px; }
+  select { padding: 9px 10px; font-size: 13px; border: 1px solid #888; border-radius: 6px; background: transparent; }
+  button { padding: 10px 20px; font-size: 14px; border: none; border-radius: 6px; background: #1a73e8; color: #fff; cursor: pointer; }
+  button:hover { background: #1558b0; }
+  button.accent { background: #188038; }
+  button.accent:hover { background: #11602c; }
+  button.danger { background: #c5221f; }
+  button.danger:hover { background: #9f1a17; }
+  button.ghost { background: rgba(127,127,127,.15); color: inherit; border: 1px solid #888; padding: 6px 12px; font-size: 13px; }
+  button.ghost:hover { background: rgba(127,127,127,.3); }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  .chk { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; color: #888; }
+  .card { border: 1px solid #ccc; border-radius: 8px; padding: 14px 16px; margin-top: 12px; }
+  .card h2 { margin: 0 0 8px; font-size: 17px; }
+  .it { border: 1px solid #ddd; border-radius: 8px; padding: 10px 12px; margin-top: 10px; background: rgba(127,127,127,.05); }
+  .it .top { display: flex; justify-content: space-between; gap: 10px; flex-wrap: wrap; align-items: baseline; }
+  .it .nm { font-size: 14px; font-weight: 600; }
+  .it .ap { color: #888; font-size: 12px; margin-left: 8px; }
+  .it .st { font-size: 12px; white-space: nowrap; }
+  .st.pending { color: #888; } .st.fetch { color: #1a73e8; } .st.dl { color: #e37400; }
+  .st.ok { color: #1a7a3a; } .st.err { color: #b00020; } .st.skip { color: #5f6368; } .st.cancel { color: #777; }
+  .track { height: 8px; background: rgba(127,127,127,.2); border-radius: 4px; overflow: hidden; margin-top: 8px; }
+  .bar { height: 100%; width: 0%; background: linear-gradient(90deg,#1a73e8,#4caf50); border-radius: 4px; transition: width .3s ease; }
+  .bar.indet { width: 40%; animation: slide 1.2s ease-in-out infinite; }
+  @keyframes slide { 0% { margin-left: 0%; } 50% { margin-left: 60%; } 100% { margin-left: 0%; } }
+  .meta { color: #777; font-size: 12px; margin-top: 6px; word-break: break-all; }
+  .logline { color: #555; font-size: 11px; margin-top: 5px; font-family: Consolas, Menlo, monospace; white-space: pre-wrap; word-break: break-all; }
+  .errmsg { color: #b00020; font-size: 12px; margin-top: 4px; word-break: break-all; }
+  .files { margin-top: 8px; }
+  .file { display: flex; justify-content: space-between; gap: 10px; padding: 6px 2px; border-bottom: 1px dashed rgba(127,127,127,.2); font-size: 13px; }
+  .file .fn { word-break: break-all; }
+  .file .sz { color: #888; white-space: nowrap; }
+  .sum { margin-top: 10px; font-size: 13px; color: #444; }
+  #status { margin-left: 10px; color: #777; font-size: 13px; }
+  .empty { color: #999; font-size: 13px; padding: 8px 0; }
+  .warn { color: #b06000; font-size: 12px; margin-top: 6px; }
+  code { background: rgba(127,127,127,.12); padding: 1px 5px; border-radius: 4px; font-size: 12px; }
+</style>
+</head>
+<body>
+<h1>🎬 Steam 游戏视频批量下载</h1>
+<div class="sub">
+  每行粘贴一个 Steam 商店链接（或纯数字 appid），点击「开始下载」后自动识别各游戏，把每个游戏的<strong>第一个宣传视频</strong>下载到本地素材目录。<br>
+  视频源为 HLS/DASH 流，由本机 <code>N_m3u8DL-CLI</code> 下载并合并成 mp4；文件名格式：<code>当天日期_游戏名_视频素材.mp4</code>。
+</div>
+
+<label for="links">Steam 链接（每行一个，可混入纯数字 appid）</label>
+<textarea id="links" placeholder="https://store.steampowered.com/app/1623730/Palworld/
+https://store.steampowered.com/app/105600/Terraria/
+https://store.steampowered.com/app/648800/Raft/"></textarea>
+
+<div class="row">
+  <input type="text" id="dir" title="视频保存目录" />
+  <select id="quality" title="画质">
+    <option value="max">最高画质</option>
+    <option value="480">480p</option>
+  </select>
+  <label class="chk"><input type="checkbox" id="skip" checked /> 跳过已存在的文件</label>
+</div>
+
+<div id="engineInfo" class="warn"></div>
+
+<div class="row">
+  <button id="start" class="accent">▶ 开始下载</button>
+  <button id="cancel" class="danger" disabled>取消任务</button>
+  <button id="openDir" class="ghost">📂 打开素材文件夹</button>
+  <button id="refresh" class="ghost">🔄 刷新文件列表</button>
+  <span id="status"></span>
+</div>
+
+<div id="preview" class="card" style="display:none">
+  <h2>链接解析</h2>
+  <div id="previewBody"></div>
+</div>
+
+<div id="jobBox" style="display:none">
+  <div class="card">
+    <h2>下载任务 <span id="jobDir"></span> <span id="jobState"></span></h2>
+    <div id="items"></div>
+    <div id="sum" class="sum"></div>
+  </div>
+</div>
+
+<div class="card">
+  <h2>已下载文件</h2>
+  <div id="files"><div class="empty">（尚未下载任何文件）</div></div>
+</div>
+
+<div class="card">
+  <h2>🎬 剪辑拼接成片</h2>
+  <div class="sub" style="margin:0 0 8px">
+    从素材列表选择文件（可填起止时间，留空 = 从头/到结尾；格式如 <code>1:00</code> 或 <code>90</code>），
+    用上下按钮调整顺序，点击「拼接成片」按顺序剪辑拼接，输出到成品目录。
+    拼接为流拷贝无损模式，自动处理不同帧率的兼容问题。
+  </div>
+  <div class="row">
+    <input type="text" id="matDir" title="素材目录" placeholder="素材目录（默认下载素材目录）" />
+    <button id="matRefresh" class="ghost">🔄 载入素材</button>
+    <button id="matAddRow" class="ghost">＋ 手动添加素材</button>
+  </div>
+  <div id="composeRows"></div>
+  <div class="row">
+    <input type="text" id="prodDir" title="成品目录" placeholder="成品目录（默认 E:/worddeepseek/videocut/product）" />
+    <input type="text" id="prodName" title="成品名（留空自动：日期_游戏名1_游戏名2…）" placeholder="成品名（留空自动生成）" />
+  </div>
+  <div class="row">
+    <button id="composeBtn" class="accent">▶ 拼接成片</button>
+    <button id="openProd" class="ghost">📂 打开成品文件夹</button>
+    <button id="refreshProd" class="ghost">🔄 刷新成品列表</button>
+    <span id="composeStatus"></span>
+  </div>
+  <div id="composeResult"></div>
+  <div class="files" id="prodFiles"><div class="empty">（暂无成品）</div></div>
+</div>
+
+<script>
+var ta = document.getElementById('links');
+var dirInput = document.getElementById('dir');
+var qs = document.getElementById('quality');
+var skipChk = document.getElementById('skip');
+var engineInfo = document.getElementById('engineInfo');
+var btnStart = document.getElementById('start');
+var btnCancel = document.getElementById('cancel');
+var btnOpen = document.getElementById('openDir');
+var btnRefresh = document.getElementById('refresh');
+var statusEl = document.getElementById('status');
+var previewBox = document.getElementById('preview');
+var previewBody = document.getElementById('previewBody');
+var jobBox = document.getElementById('jobBox');
+var itemsEl = document.getElementById('items');
+var sumEl = document.getElementById('sum');
+var jobDirEl = document.getElementById('jobDir');
+var jobStateEl = document.getElementById('jobState');
+var filesEl = document.getElementById('files');
+
+var curJob = null;
+
+function esc(s) { return String(s == null ? '' : s).replace(/[&<>"]/g, function(c){ return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]; }); }
+function setStatus(t) { statusEl.textContent = t || ''; }
+function parseLines() {
+  return ta.value.split(/\r?\n/).map(function(s){ return s.trim(); }).filter(Boolean).map(function(line){
+    var m = line.match(/app\/(\d+)/i);
+    var appid = m ? m[1] : (/^\d{1,10}$/.test(line) ? line : null);
+    return { line: line, appid: appid };
+  });
+}
+function updatePreview() {
+  var rows = parseLines();
+  if (!rows.length) { previewBox.style.display = 'none'; return; }
+  var seen = {}; var html = ''; var ok = 0;
+  rows.forEach(function(r){
+    if (r.appid && !seen[r.appid]) { seen[r.appid] = 1; ok++; }
+  });
+  html += '<div class="meta">共 ' + rows.length + ' 行，识别出 ' + ok + ' 个不重复游戏：</div>';
+  html += '<div class="meta">' + rows.map(function(r){
+    return (r.appid ? '✅ appid ' + esc(r.appid) : '⚠️ 无效：' + esc(r.line));
+  }).join('　') + '</div>';
+  previewBody.innerHTML = html;
+  previewBox.style.display = 'block';
+}
+
+function stateClass(s) {
+  if (s === '下载中' || s === '获取游戏信息') return 'dl';
+  if (s === '完成') return 'ok';
+  if (s === '失败' || s === '无效链接') return 'err';
+  if (s === '已存在') return 'skip';
+  if (s === '已取消') return 'cancel';
+  return 'pending';
+}
+
+function renderJob(job) {
+  curJob = job;
+  jobBox.style.display = 'block';
+  jobDirEl.textContent = '→ ' + job.dir;
+  jobStateEl.textContent = job.status === 'running' ? '（进行中）' : (job.status === 'done' ? '（已完成）' : (job.status === 'canceled' ? '（已取消）' : '（出错）'));
+  jobStateEl.style.color = job.status === 'done' ? '#1a7a3a' : (job.status === 'running' ? '#1a73e8' : '#b00020');
+
+  var html = '';
+  job.items.forEach(function(it){
+    var stateHtml = '<span class="st ' + stateClass(it.state) + '">' + esc(it.state) + '</span>';
+    var nm = it.name ? esc(it.name) : (it.appid ? 'App ' + esc(it.appid) : '未知游戏');
+    var ap = it.appid ? '<span class="ap">appid ' + esc(it.appid) + '</span>' : '';
+    html += '<div class="it"><div class="top"><div><span class="nm">' + nm + '</span>' + ap + '</div>' + stateHtml + '</div>';
+    if (it.state === '下载中' || it.state === '完成' || it.state === '已存在') {
+      var pct = it.percent || 0;
+      var barCls = (it.state === '下载中' && !pct) ? 'bar indet' : 'bar';
+      html += '<div class="track"><div class="' + barCls + '" style="width:' + (pct || (barCls.indexOf('indet') >= 0 ? '' : 0)) + '%"></div></div>';
+      var meta = [];
+      if (it.state === '下载中') meta.push((pct ? pct + '%' : '…') + (it.speed ? '　' + esc(it.speed) : ''));
+      if (it.size) meta.push(esc(formatSizeClient(it.size)));
+      if (it.videoLabel) meta.push('视频源：' + esc(it.videoLabel) + (it.videoKind === 'direct' ? '' : '（N_m3u8DL-CLI 下载合并）'));
+      if (it.path) meta.push(esc(it.path));
+      if (meta.length) html += '<div class="meta">' + meta.join('<br>') + '</div>';
+    }
+    if (it.log && it.log.length && it.state === '下载中') {
+      html += '<div class="logline">' + esc(it.log.join('\n')) + '</div>';
+    }
+    if (it.error) html += '<div class="errmsg">' + esc(it.error) + '</div>';
+    html += '</div>';
+  });
+  itemsEl.innerHTML = html;
+
+  if (job.status !== 'running') {
+    var ok = job.items.filter(function(i){ return i.state === '完成' || i.state === '已存在'; }).length;
+    var fail = job.items.filter(function(i){ return i.state === '失败' || i.state === '无效链接'; }).length;
+    sumEl.textContent = '✅ 成功 ' + ok + ' 个　⚠️ 失败 ' + fail + ' 个　📁 素材目录：' + job.dir;
+    btnCancel.disabled = true;
+    btnStart.disabled = false;
+    setStatus('');
+    refreshFiles();
+  } else {
+    btnCancel.disabled = false;
+    btnStart.disabled = true;
+  }
+}
+
+function formatSizeClient(n) {
+  n = Number(n) || 0;
+  if (n < 1024) return n + ' B';
+  if (n < 1048576) return (n / 1024).toFixed(1) + ' KB';
+  if (n < 1073741824) return (n / 1048576).toFixed(1) + ' MB';
+  return (n / 1073741824).toFixed(2) + ' GB';
+}
+
+function connect(jobId) {
+  if (window.__es) { window.__es.close(); window.__es = null; }
+  var es = new EventSource('/api/events?jobId=' + encodeURIComponent(jobId));
+  window.__es = es;
+  es.onmessage = function(ev) {
+    var msg;
+    try { msg = JSON.parse(ev.data); } catch (e) { return; }
+    if (msg.type === 'snapshot') renderJob(msg.job);
+  };
+  es.onerror = function() {
+    if (curJob && curJob.status !== 'running' && window.__es) { window.__es.close(); window.__es = null; }
+  };
+}
+
+function start() {
+  var rows = parseLines();
+  if (!rows.length) { setStatus('请先粘贴 Steam 链接'); return; }
+  var links = rows.map(function(r){ return r.line; });
+  var dir = dirInput.value.trim() || '';
+  btnStart.disabled = true;
+  setStatus('正在创建任务……');
+  fetch('/api/download', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ links: links, dir: dir, skipExisting: skipChk.checked, quality: qs.value })
+  })
+    .then(function(r){ return r.json(); })
+    .then(function(res){
+      if (res.error) { setStatus('启动失败：' + res.error); btnStart.disabled = false; return; }
+      setStatus('任务已启动……');
+      connect(res.jobId);
+    })
+    .catch(function(e){ setStatus('启动失败：' + e.message); btnStart.disabled = false; });
+}
+
+function cancel() {
+  if (!curJob) return;
+  fetch('/api/cancel?jobId=' + encodeURIComponent(curJob.id)).then(function(r){ return r.json(); }).then(function(res){
+    if (res.error) setStatus('取消失败：' + res.error);
+  }).catch(function(e){ setStatus('取消失败：' + e.message); });
+}
+
+function refreshFiles() {
+  var dir = dirInput.value.trim() || 'default';
+  fetch('/api/files?dir=' + encodeURIComponent(dir))
+    .then(function(r){ return r.json(); })
+    .then(function(res){
+      if (res.error) { filesEl.innerHTML = '<div class="empty">' + esc(res.error) + '</div>'; return; }
+      if (!res.files.length) { filesEl.innerHTML = '<div class="empty">该目录下还没有视频文件</div>'; return; }
+      var html = '';
+      res.files.forEach(function(f){
+        html += '<div class="file"><span class="fn">🎬 ' + esc(f.name) + '</span><span class="sz">' + formatSizeClient(f.size) + '</span></div>';
+      });
+      filesEl.innerHTML = html;
+    })
+    .catch(function(e){ filesEl.innerHTML = '<div class="empty">读取失败：' + esc(e.message) + '</div>'; });
+}
+
+function openDir() {
+  var dir = dirInput.value.trim() || '';
+  fetch('/api/open-folder?dir=' + encodeURIComponent(dir))
+    .then(function(r){ return r.json(); })
+    .then(function(res){ if (res.error) setStatus(res.error); else setStatus('已打开文件夹'); })
+    .catch(function(e){ setStatus('打开失败：' + e.message); });
+}
+
+// 加载配置（默认目录 + 内置引擎状态）
+fetch('/api/config').then(function(r){ return r.json(); }).then(function(res){
+  if (!dirInput.value.trim()) dirInput.value = res.dir;
+  if (res.ffmpeg && res.builtin) engineInfo.textContent = '✅ HLS 解析下载已内置（Node），合并引擎：内置 ffmpeg（' + res.ffmpeg + '），无需配置任何外部工具';
+  else if (res.ffmpeg) engineInfo.textContent = '✅ HLS 解析下载已内置（Node），合并引擎：系统 ffmpeg（' + res.ffmpeg + '）';
+  else engineInfo.textContent = '⚠️ 未找到 ffmpeg（请检查工具目录 bin\\ 或本机安装），下载合并将不可用';
+  refreshFiles();
+}).catch(function(){});
+
+btnStart.addEventListener('click', start);
+btnCancel.addEventListener('click', cancel);
+btnOpen.addEventListener('click', openDir);
+btnRefresh.addEventListener('click', refreshFiles);
+ta.addEventListener('input', updatePreview);
+dirInput.addEventListener('change', refreshFiles);
+updatePreview();
+
+// ===== 剪辑拼接成片 =====
+var matDirInput = document.getElementById('matDir');
+var prodDirInput = document.getElementById('prodDir');
+var prodNameInput = document.getElementById('prodName');
+var composeRowsEl = document.getElementById('composeRows');
+var composeStatusEl = document.getElementById('composeStatus');
+var composeResultEl = document.getElementById('composeResult');
+var prodFilesEl = document.getElementById('prodFiles');
+var composeBtn = document.getElementById('composeBtn');
+var composeRows = [];
+
+function cStatus(t) { composeStatusEl.textContent = t || ''; }
+
+function addComposeRow(row) {
+  composeRows.push({
+    path: (row && row.path) || '',
+    name: (row && row.name) || '',
+    start: (row && row.start) || '',
+    end: (row && row.end) || ''
+  });
+  renderCompose();
+}
+function removeComposeRow(i) { composeRows.splice(i, 1); renderCompose(); }
+function moveComposeRow(i, d) {
+  var j = i + d;
+  if (j < 0 || j >= composeRows.length) return;
+  var t = composeRows[i]; composeRows[i] = composeRows[j]; composeRows[j] = t;
+  renderCompose();
+}
+function renderCompose() {
+  if (!composeRows.length) {
+    composeRowsEl.innerHTML = '<div class="empty">素材列表为空：点「载入素材」从素材目录载入，或「手动添加素材」。</div>';
+    return;
+  }
+  var html = '';
+  composeRows.forEach(function(r, i) {
+    html += '<div class="it"><div class="top">';
+    html += '<input type="text" data-i="' + i + '" data-f="name" value="' + esc(r.name) + '" placeholder="名称" style="flex:1;min-width:120px" />';
+    html += '<button class="ghost" onclick="moveComposeRow(' + i + ',-1)" title="上移">↑</button>';
+    html += '<button class="ghost" onclick="moveComposeRow(' + i + ',1)" title="下移">↓</button>';
+    html += '<button class="danger" style="padding:6px 10px" onclick="removeComposeRow(' + i + ')" title="移除">×</button>';
+    html += '</div><div class="top" style="margin-top:6px">';
+    html += '<input type="text" data-i="' + i + '" data-f="start" value="' + esc(r.start) + '" placeholder="开始（留空=0）" style="width:130px" />';
+    html += '<input type="text" data-i="' + i + '" data-f="end" value="' + esc(r.end) + '" placeholder="结束（留空=末尾）" style="width:130px" />';
+    html += '</div><div class="meta">' + esc(r.path) + '</div></div>';
+  });
+  composeRowsEl.innerHTML = html;
+  composeRowsEl.querySelectorAll('input').forEach(function(inp) {
+    inp.addEventListener('input', function() {
+      var idx = Number(inp.getAttribute('data-i'));
+      var f = inp.getAttribute('data-f');
+      if (composeRows[idx]) composeRows[idx][f] = inp.value;
+    });
+  });
+}
+
+function loadMaterials() {
+  var dir = matDirInput.value.trim() || '';
+  cStatus('正在载入素材……');
+  fetch('/api/materials?dir=' + encodeURIComponent(dir))
+    .then(function(r){ return r.json(); })
+    .then(function(res){
+      if (res.error) { cStatus(res.error); return; }
+      if (!matDirInput.value.trim()) matDirInput.value = res.dir;
+      var seen = {};
+      res.files.forEach(function(f) {
+        if (seen[f.path]) return;
+        seen[f.path] = 1;
+        composeRows.push({ path: f.path, name: f.gameName || '', start: '', end: '' });
+      });
+      renderCompose();
+      cStatus('已载入 ' + res.files.length + ' 个素材');
+    })
+    .catch(function(e){ cStatus('载入失败：' + e.message); });
+}
+
+function compose() {
+  if (!composeRows.length) { cStatus('素材列表为空'); return; }
+  var materials = composeRows.map(function(r) {
+    return { name: r.name, path: r.path, start: r.start, end: r.end };
+  });
+  var payload = {
+    materials: materials,
+    outDir: prodDirInput.value.trim(),
+    outName: prodNameInput.value.trim()
+  };
+  composeBtn.disabled = true;
+  cStatus('正在剪辑拼接（流拷贝无损，稍候）……');
+  composeResultEl.innerHTML = '';
+  fetch('/api/compose', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload)
+  })
+    .then(function(r){ return r.json(); })
+    .then(function(res){
+      if (res.error) {
+        cStatus('拼接失败');
+        composeResultEl.innerHTML = '<div class="errmsg">' + esc(res.error) + '</div>';
+        return;
+      }
+      cStatus('完成 ✓');
+      composeResultEl.innerHTML = '<div class="meta" style="color:#1a7a3a;margin-top:6px">✅ 成品已生成：<b>' + esc(res.output) + '</b>（' + formatSizeClient(res.size) + '）</div>';
+      refreshProd();
+    })
+    .catch(function(e){
+      cStatus('拼接失败');
+      composeResultEl.innerHTML = '<div class="errmsg">请求失败：' + esc(e.message) + '</div>';
+    })
+    .finally(function(){ composeBtn.disabled = false; });
+}
+
+function refreshProd() {
+  var dir = prodDirInput.value.trim() || 'default';
+  fetch('/api/files?dir=' + encodeURIComponent(dir))
+    .then(function(r){ return r.json(); })
+    .then(function(res){
+      if (res.error) { prodFilesEl.innerHTML = '<div class="empty">' + esc(res.error) + '</div>'; return; }
+      if (!res.files.length) { prodFilesEl.innerHTML = '<div class="empty">该目录下还没有成品</div>'; return; }
+      var html = '';
+      res.files.forEach(function(f) {
+        html += '<div class="file"><span class="fn">🎬 ' + esc(f.name) + '</span><span class="sz">' + formatSizeClient(f.size) + '</span></div>';
+      });
+      prodFilesEl.innerHTML = html;
+    })
+    .catch(function(e){ prodFilesEl.innerHTML = '<div class="empty">读取失败：' + esc(e.message) + '</div>'; });
+}
+
+function openProd() {
+  var dir = prodDirInput.value.trim() || '';
+  fetch('/api/open-folder?dir=' + encodeURIComponent(dir))
+    .then(function(r){ return r.json(); })
+    .then(function(res){ if (res.error) cStatus(res.error); else cStatus('已打开成品文件夹'); })
+    .catch(function(e){ cStatus('打开失败：' + e.message); });
+}
+
+document.getElementById('matRefresh').addEventListener('click', loadMaterials);
+document.getElementById('matAddRow').addEventListener('click', function(){ addComposeRow({}); });
+composeBtn.addEventListener('click', compose);
+document.getElementById('openProd').addEventListener('click', openProd);
+document.getElementById('refreshProd').addEventListener('click', refreshProd);
+prodDirInput.addEventListener('change', refreshProd);
+// 初始化：自动载入素材目录 + 成品列表
+matDirInput.value = '';
+prodDirInput.value = '';
+loadMaterials();
+refreshProd();
+</script>
+</body>
+</html>`;
+
+// ── HTTP 处理 ────────────────────────────────────────────────────────────────
+
+function json(res, status, body) {
+  const text = JSON.stringify(body);
+  res.writeHead(status, {
+    'Content-Type': 'application/json; charset=utf-8',
+    'Content-Length': Buffer.byteLength(text),
+    'Cache-Control': 'no-store, no-cache, must-revalidate',
+  });
+  res.end(text);
+}
+
+function html(res) {
+  res.writeHead(200, {
+    'Content-Type': 'text/html; charset=utf-8',
+    'Content-Length': Buffer.byteLength(PAGE),
+    'Cache-Control': 'no-store, no-cache, must-revalidate',
+  });
+  res.end(PAGE);
+}
+
+function readBody(req) {
+  return new Promise((resolve, reject) => {
+    let data = '';
+    req.on('data', (c) => (data += c));
+    req.on('end', () => resolve(data));
+    req.on('error', reject);
+  });
+}
+
+// GET /api/config：返回默认目录与内置引擎状态。
+function handleConfig(res) {
+  const ff = resolveFfmpeg();
+  const builtin = !!ff && ff.startsWith(path.join(SCRIPT_DIR, 'bin'));
+  return json(res, 200, { dir: DEFAULT_DIR, ffmpeg: ff || '', builtin });
+}
+
+// POST /api/download：创建下载任务。
+async function handleDownload(req, res) {
+  let payload;
+  try {
+    payload = JSON.parse(await readBody(req));
+  } catch {
+    return json(res, 400, { error: '请求体不是合法 JSON' });
+  }
+  const links = (Array.isArray(payload.links) ? payload.links : []).map(String).filter((s) => s.trim());
+  if (!links.length) return json(res, 400, { error: '请至少输入一个 Steam 链接或 appid' });
+  const dir = String(payload.dir || '').trim() || DEFAULT_DIR;
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+  } catch (e) {
+    return json(res, 400, { error: `无法创建下载目录：${e.message}` });
+  }
+  const job = createJob({
+    links,
+    dir,
+    skipExisting: payload.skipExisting !== false,
+    quality: payload.quality === '480' ? '480' : 'max',
+  });
+  jobs.set(job.id, job);
+  runJob(job); // 异步执行，不阻塞响应
+  return json(res, 200, { jobId: job.id, dir });
+}
+
+// GET /api/events?jobId=... ：SSE 进度推送。
+function handleEvents(req, res, urlObj) {
+  const jobId = urlObj.searchParams.get('jobId') || '';
+  const job = jobs.get(jobId);
+  if (!job) return json(res, 404, { error: '任务不存在' });
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream; charset=utf-8',
+    'Cache-Control': 'no-store, no-cache, must-revalidate',
+    Connection: 'keep-alive',
+  });
+  res.write(`data: ${JSON.stringify({ type: 'snapshot', job: jobView(job) })}\n\n`);
+  job.listeners.add(res);
+  const hb = setInterval(() => {
+    try { res.write(': ping\n\n'); } catch { /* ignore */ }
+  }, 15000);
+  req.on('close', () => {
+    clearInterval(hb);
+    job.listeners.delete(res);
+  });
+}
+
+// GET /api/job?jobId=... ：查询任务快照（页面刷新后恢复用）。
+function handleJob(urlObj, res) {
+  const job = jobs.get(urlObj.searchParams.get('jobId') || '');
+  if (!job) return json(res, 404, { error: '任务不存在' });
+  return json(res, 200, { job: jobView(job) });
+}
+
+// POST /api/cancel?jobId=... ：取消任务。
+function handleCancel(urlObj, res) {
+  const ok = cancelJob(urlObj.searchParams.get('jobId') || '');
+  return json(res, ok ? 200 : 404, ok ? { canceled: true } : { error: '任务不存在' });
+}
+
+// GET /api/files?dir=... ：列出下载目录里的文件。
+function handleFiles(urlObj, res) {
+  const dir = urlObj.searchParams.get('dir') || DEFAULT_DIR;
+  return json(res, 200, { dir, files: listFiles(dir) });
+}
+
+// GET /api/open-folder?dir=... ：在资源管理器中打开目录。
+function handleOpenFolder(urlObj, res) {
+  const dir = urlObj.searchParams.get('dir') || DEFAULT_DIR;
+  if (!fs.existsSync(dir)) return json(res, 400, { error: '目录不存在：' + dir });
+  try {
+    const cp = spawn('explorer', [dir], { stdio: 'ignore', detached: true });
+    cp.on('error', (e) => json(res, 500, { error: `打开失败：${e.message}` }));
+    cp.unref();
+    return json(res, 200, { ok: true, dir });
+  } catch (e) {
+    return json(res, 500, { error: `打开失败：${e.message}` });
+  }
+}
+
+// ── 主逻辑 ───────────────────────────────────────────────────────────────────
+
+// 自检模式：定位网络问题。
+async function runTest() {
+  const proxyRaw = resolveProxy();
+  console.log('========== 网络自检 ==========');
+  console.log('代理设置：', proxyRaw ? proxyRaw : '（未设置）');
+  if (proxyRaw) {
+    try {
+      const p = parseProxy(proxyRaw);
+      console.log(`代理解析：${p.kind}://${p.host}:${p.port}`);
+    } catch (e) {
+      console.log('代理解析失败：', e.message);
+    }
+  }
+  console.log('ffmpeg：', resolveFfmpeg() || '（未找到）');
+  console.log('-----------------------------------------');
+  console.log('1) DNS 解析 store.steampowered.com ...');
+  try {
+    const addrs = await dns.promises.resolve4('store.steampowered.com');
+    console.log('   IPv4 解析成功：', addrs.join(', '));
+  } catch (e) {
+    console.log('   DNS 解析失败：', e.message);
+  }
+  console.log('2) 连接 store.steampowered.com:443 ...');
+  await new Promise((resolve) => {
+    const sock = net.connect(443, 'store.steampowered.com');
+    sock.setTimeout(10000);
+    sock.once('connect', () => { console.log('   TCP 连接成功'); sock.destroy(); resolve(); });
+    sock.once('timeout', () => { console.log('   TCP 连接超时（10s）'); sock.destroy(); resolve(); });
+    sock.once('error', (e) => { console.log('   TCP 连接失败：', e.message); resolve(); });
+  });
+  console.log('3) 调用 appdetails 接口（appid 105600）...');
+  try {
+    const data = await fetchApp('105600');
+    if (!data) console.log('   接口正常，但 appid 105600 未返回数据');
+    else {
+      const movies = Array.isArray(data.movies) ? data.movies : [];
+      const src = movies[0] ? pickSource(movies[0], 'max') : null;
+      console.log('   ✅ 成功！游戏名：', data.name, '| 视频数：', movies.length);
+      console.log('   第一个视频源：', src ? `${src.kind} / ${src.label}` : '（无）');
+      if (src) console.log('   URL：', src.url.slice(0, 120) + '...');
+    }
+  } catch (e) {
+    console.log('   接口调用失败：', describeError(e));
+  }
+  console.log('==============================');
+}
+
+function main() {
+  const cliArg = process.argv[2];
+  if (cliArg === '--test' || cliArg === '-t') {
+    runTest().catch((e) => console.error('自检出错：', e));
+    return;
+  }
+
+  const proxyRaw = resolveProxy();
+  const server = createServer((req, res) => {
+    const urlObj = new URL(req.url, `http://localhost:${PORT}`);
+    const p = urlObj.pathname;
+    if (p === '/api/download' && req.method === 'POST') {
+      handleDownload(req, res).catch((e) => json(res, 500, { error: e.message }));
+    } else if (p === '/api/events') {
+      handleEvents(req, res, urlObj);
+    } else if (p === '/api/job') {
+      handleJob(urlObj, res);
+    } else if (p === '/api/cancel') {
+      handleCancel(urlObj, res);
+    } else if (p === '/api/files') {
+      handleFiles(urlObj, res);
+    } else if (p === '/api/materials') {
+      handleMaterials(urlObj, res);
+    } else if (p === '/api/compose' && req.method === 'POST') {
+      handleCompose(req, res).catch((e) => json(res, 500, { error: e.message }));
+    } else if (p === '/api/open-folder') {
+      handleOpenFolder(urlObj, res);
+    } else if (p === '/api/config') {
+      handleConfig(res);
+    } else if (p === '/favicon.ico') {
+      res.writeHead(204); res.end();
+    } else {
+      html(res);
+    }
+  });
+  server.on('error', (e) => {
+    if (e.code === 'EADDRINUSE') {
+      console.error(`端口 ${PORT} 被占用。请用环境变量 PORT 换一个端口，例如：set PORT=8899 && node steam-video-downloader.mjs`);
+    } else {
+      console.error('服务器启动失败：', e.message);
+    }
+    process.exit(1);
+  });
+  server.listen(PORT, () => {
+    console.log(`🎬 Steam 游戏视频批量下载工具已启动：http://localhost:${PORT}`);
+    console.log(`   视频默认保存目录：${DEFAULT_DIR}（网页里可改）`);
+    console.log(`   内置引擎：HLS 解析下载（Node）+ ffmpeg 合并（${resolveFfmpeg() || '未找到 ffmpeg'}）`);
+    console.log(`   语言=${LANG}，货币区域=${CC}`);
+    if (proxyRaw) console.log(`   使用代理：${proxyRaw}`);
+    else console.log('   未检测到代理。若访问 Steam 需要代理，请设置 HTTPS_PROXY 环境变量后重启。');
+  });
+}
+
+// 若未以 --use-system-ca 启动，自动带该参数重启自身，解决中间人证书校验问题。
+// 设 STEAM_NO_RELAUNCH=1 可关闭此行为；--insecure 也会跳过重启。
+const hasSystemCA = process.execArgv.includes('--use-system-ca');
+if (!INSECURE && !hasSystemCA && !process.env.STEAM_NO_RELAUNCH) {
+  console.error('ℹ️  自动以 --use-system-ca 重启自身，信任 Windows 系统证书库（解决证书校验失败）……');
+  const child = spawn(process.execPath, ['--use-system-ca', ...process.argv.slice(1)], { stdio: 'inherit' });
+  child.on('error', (e) => {
+    console.error('自动重启失败：', e.message);
+    console.error('可手动运行：node --use-system-ca ' + process.argv.slice(1).join(' '));
+    process.exit(1);
+  });
+  child.on('exit', (code) => process.exit(code ?? 0));
+} else {
+  main();
+}

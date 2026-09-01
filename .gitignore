@@ -1,0 +1,11 @@
+# ffmpeg 二进制（约 98MB）不入库：从 Release 附件下载后放入 bin/，或设置 FFMPEG_PATH
+bin/ffmpeg.exe
+
+# 运行日志 / 临时文件
+*.log
+Logs/
+.tmp*/
+
+# Node
+node_modules/
+*.tgz
