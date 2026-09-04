@@ -61,6 +61,10 @@ const LANG = process.env.STEAM_LANG || 'schinese';
 const CC = process.env.STEAM_CC || 'cn';
 // 默认保存目录：素材统一放这里，方便后续合并成片。
 const DEFAULT_DIR = process.env.VIDEO_DIR || 'E:/worddeepseek/videocut/material';
+// 配音文件默认目录（按 01/02/03… 前缀命名，顺序 = 素材段顺序）。
+const DEFAULT_VOICE_DIR = process.env.VOICE_DIR || 'E:/worddeepseek/videocut/voice';
+// 配音可接受的音频扩展名。
+const VOICE_EXTS = /\.(mp3|wav|m4a|aac|flac|ogg|wma|opus)$/i;
 const UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 
@@ -102,6 +106,31 @@ function uniquePath(p) {
     if (!fs.existsSync(c)) return c;
   }
   return `${base}_${Date.now()}${ext}`;
+}
+
+// 自然排序：把文件名拆成"文本/数字"交替段，数字按数值比（1,2,10 而非 1,10,2）。
+function splitNaturalParts(s) {
+  return String(s ?? '').toLowerCase().split(/(\d+)/).filter(Boolean).map((seg) => {
+    if (/^\d+$/.test(seg)) return { isNum: true, num: Number(seg), text: seg };
+    return { isNum: false, num: null, text: seg };
+  });
+}
+function naturalCompare(a, b) {
+  const pa = splitNaturalParts(a);
+  const pb = splitNaturalParts(b);
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    const x = pa[i];
+    const y = pb[i];
+    if (x === undefined) return -1;
+    if (y === undefined) return 1;
+    if (x.isNum && y.isNum) {
+      if (x.num !== y.num) return x.num - y.num;
+      continue;
+    }
+    const c = x.text.localeCompare(y.text, 'zh');
+    if (c !== 0) return c;
+  }
+  return 0;
 }
 
 // ── 网络层：支持代理（HTTP/HTTPS/SOCKS5）+ 更清晰的错误 ──────────────────────
@@ -976,6 +1005,78 @@ async function composeVideos(materials, outDir, outName) {
   return { output: dest, size: st.size };
 }
 
+// ── 配音上传（真人配音，01/02/03… 前缀，顺序 = 素材段顺序）────────────────────
+
+// GET /api/voice/list?dir=... ：列出配音目录音频，按文件名自然排序。
+function handleVoiceList(urlObj, res) {
+  const dir = urlObj.searchParams.get('dir') || DEFAULT_VOICE_DIR;
+  let files = [];
+  try {
+    files = fs.readdirSync(dir)
+      .filter((f) => VOICE_EXTS.test(f))
+      .map((f) => {
+        const st = fs.statSync(path.join(dir, f));
+        return { name: f, size: st.size, mtime: st.mtimeMs, path: path.join(dir, f) };
+      })
+      .sort((a, b) => naturalCompare(a.name, b.name));
+  } catch {
+    // 目录不存在或不可读时返回空列表
+  }
+  return json(res, 200, { dir, files });
+}
+
+// POST /api/voice/upload?name=xx.mp3&dir=... ：上传单个音频（body 为文件二进制，流式落盘，同名覆盖）。
+function handleVoiceUpload(req, res, urlObj) {
+  const name = String(urlObj.searchParams.get('name') || '').trim();
+  const dir = urlObj.searchParams.get('dir') || DEFAULT_VOICE_DIR;
+  if (!name || name.includes('..') || name.includes('/') || name.includes('\\')) {
+    return json(res, 400, { error: '文件名无效' });
+  }
+  if (!VOICE_EXTS.test(name)) {
+    return json(res, 400, { error: `不支持的音频格式，支持：mp3/wav/m4a/aac/flac/ogg/wma/opus` });
+  }
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+  } catch (e) {
+    return json(res, 400, { error: `无法创建配音目录：${e.message}` });
+  }
+  const target = path.join(dir, name);
+  const ws = fs.createWriteStream(target);
+  req.pipe(ws);
+  ws.on('finish', () => {
+    try {
+      const st = fs.statSync(target);
+      return json(res, 200, { ok: true, name, size: st.size });
+    } catch (e) {
+      return json(res, 500, { error: `保存失败：${e.message}` });
+    }
+  });
+  ws.on('error', (e) => {
+    try { fs.rmSync(target, { force: true }); } catch { /* ignore */ }
+    return json(res, 500, { error: `写入失败：${e.message}` });
+  });
+  req.on('aborted', () => {
+    try { ws.destroy(); fs.rmSync(target, { force: true }); } catch { /* ignore */ }
+  });
+}
+
+// GET /api/voice/delete?name=xx.mp3&dir=... ：删除一个配音文件。
+function handleVoiceDelete(urlObj, res) {
+  const dir = urlObj.searchParams.get('dir') || DEFAULT_VOICE_DIR;
+  const name = String(urlObj.searchParams.get('name') || '').trim();
+  if (!name || name.includes('..') || name.includes('/') || name.includes('\\')) {
+    return json(res, 400, { error: '文件名无效' });
+  }
+  const target = path.join(dir, name);
+  if (!fs.existsSync(target)) return json(res, 404, { error: '文件不存在' });
+  try {
+    fs.rmSync(target, { force: true });
+    return json(res, 200, { ok: true });
+  } catch (e) {
+    return json(res, 500, { error: `删除失败：${e.message}` });
+  }
+}
+
 // GET /api/materials?dir=... ：列出素材目录的 mp4（附带解析出的游戏名）。
 function handleMaterials(urlObj, res) {
   const dir = urlObj.searchParams.get('dir') || DEFAULT_DIR;
@@ -1113,6 +1214,28 @@ https://store.steampowered.com/app/648800/Raft/"></textarea>
 <div class="card">
   <h2>已下载文件</h2>
   <div id="files"><div class="empty">（尚未下载任何文件）</div></div>
+</div>
+
+<div class="card">
+  <h2>🎙️ 配音上传（真人配音 · 分段）</h2>
+  <div class="sub" style="margin:0 0 8px">
+    一次拖入/选择多段真人配音（mp3/wav/m4a…），建议文件名以 <code>01_</code> <code>02_</code> <code>03_</code> 为前缀，
+    程序按数字大小排序 —— <strong>顺序 = 素材段顺序 = Excel 行顺序</strong>（第 1 个 = 配音01 = 素材段1）。
+    同名文件重新上传会覆盖。
+  </div>
+  <div class="row">
+    <input type="text" id="voiceDir" title="配音目录" placeholder="配音目录（默认 E:/worddeepseek/videocut/voice）" />
+    <button id="voicePick" class="ghost">📁 选择文件</button>
+    <input type="file" id="voiceFileInput" multiple accept=".mp3,.wav,.m4a,.aac,.flac,.ogg,.wma,.opus,audio/*" style="display:none" />
+    <button id="voiceRefresh" class="ghost">🔄 刷新列表</button>
+    <button id="voiceClear" class="ghost">🗑️ 清空列表</button>
+    <span id="voiceStatus"></span>
+  </div>
+  <div id="voiceUploadList" class="files"></div>
+  <div class="card" style="margin-top:10px;padding:10px 12px">
+    <h2 style="font-size:14px;margin:0 0 6px">已上传配音（按 01/02/03 顺序排列）</h2>
+    <div id="voiceFiles"><div class="empty">（暂无配音，先上传）</div></div>
+  </div>
 </div>
 
 <div class="card">
@@ -1333,6 +1456,128 @@ btnRefresh.addEventListener('click', refreshFiles);
 ta.addEventListener('input', updatePreview);
 dirInput.addEventListener('change', refreshFiles);
 updatePreview();
+
+// ===== 配音上传（01/02/03… 按序） =====
+var voiceDirInput = document.getElementById('voiceDir');
+var voiceStatusEl = document.getElementById('voiceStatus');
+var voiceUploadListEl = document.getElementById('voiceUploadList');
+var voiceFilesEl = document.getElementById('voiceFiles');
+var voiceFileInput = document.getElementById('voiceFileInput');
+var voiceFiles = []; // 已上传列表
+
+function vStatus(t) { voiceStatusEl.textContent = t || ''; }
+function voiceDirVal() { return voiceDirInput.value.trim() || ''; }
+function isVoiceExt(name) { return /\.(mp3|wav|m4a|aac|flac|ogg|wma|opus)$/i.test(name); }
+
+function loadVoiceFiles() {
+  fetch('/api/voice/list?dir=' + encodeURIComponent(voiceDirVal()))
+    .then(function(r){ return r.json(); })
+    .then(function(res){
+      if (res.error) { voiceFilesEl.innerHTML = '<div class="empty">' + esc(res.error) + '</div>'; return; }
+      if (!voiceDirInput.value.trim()) voiceDirInput.value = res.dir;
+      voiceFiles = res.files;
+      if (!voiceFiles.length) { voiceFilesEl.innerHTML = '<div class="empty">（暂无配音，先上传）</div>'; return; }
+      var html = '';
+      voiceFiles.forEach(function(f, i) {
+        html += '<div class="file"><span class="fn">' + '#' + (i + 1) + '　🎙️ ' + esc(f.name) + '</span><span class="sz">' + formatSizeClient(f.size) + '　<button class="danger" style="padding:2px 8px" onclick="deleteVoiceFile(' + i + ')">删除</button></span></div>';
+      });
+      voiceFilesEl.innerHTML = html;
+    })
+    .catch(function(e){ voiceFilesEl.innerHTML = '<div class="empty">读取失败：' + esc(e.message) + '</div>'; });
+}
+
+function deleteVoiceFile(i) {
+  var f = voiceFiles[i];
+  if (!f) return;
+  if (!window.confirm('删除配音：' + f.name + '？')) return;
+  fetch('/api/voice/delete?name=' + encodeURIComponent(f.name) + '&dir=' + encodeURIComponent(voiceDirVal()))
+    .then(function(r){ return r.json(); })
+    .then(function(res){ if (res.error) vStatus(res.error); else { vStatus('已删除 ' + f.name); loadVoiceFiles(); } })
+    .catch(function(e){ vStatus('删除失败：' + e.message); });
+}
+
+function uploadVoiceFiles(fileList) {
+  var files = Array.prototype.slice.call(fileList || []).filter(function(f){ return isVoiceExt(f.name); });
+  var bad = (fileList ? fileList.length : 0) - files.length;
+  if (!files.length) { vStatus('没有可上传的音频文件（支持 mp3/wav/m4a/aac/flac/ogg/wma/opus）'); return; }
+  var dir = voiceDirVal();
+  var html = '';
+  var items = files.map(function(f){
+    return { f: f, state: '排队', pct: 0 };
+  });
+  items.forEach(function(it){
+    html += '<div class="file"><span class="fn">' + esc(it.f.name) + '</span><span class="sz" data-sz>排队中</span></div>';
+  });
+  voiceUploadListEl.innerHTML = html;
+  if (bad) vStatus('已跳过 ' + bad + ' 个非音频文件');
+  else vStatus('开始上传 ' + items.length + ' 个文件……');
+
+  var els = voiceUploadListEl.querySelectorAll('.file');
+  var run = function(it, idx) {
+    var el = els[idx];
+    var szEl = el.querySelector('[data-sz]');
+    var xhr = new XMLHttpRequest();
+    xhr.open('POST', '/api/voice/upload?name=' + encodeURIComponent(it.f.name) + '&dir=' + encodeURIComponent(dir));
+    xhr.upload.onprogress = function(ev) {
+      if (ev.lengthComputable) {
+        it.pct = Math.round((ev.loaded / ev.total) * 100);
+        szEl.textContent = it.pct + '%';
+      }
+    };
+    xhr.onload = function() {
+      var res;
+      try { res = JSON.parse(xhr.responseText); } catch (e) { res = { error: '响应异常' }; }
+      if (xhr.status === 200 && res.ok) { it.state = '完成'; szEl.textContent = '✅ ' + formatSizeClient(res.size); }
+      else { it.state = '失败'; szEl.textContent = '❌ ' + (res.error || '上传失败'); }
+    };
+    xhr.onerror = function() { it.state = '失败'; szEl.textContent = '❌ 网络错误'; };
+    xhr.send(it.f);
+  };
+  // 并发 3 个上传
+  var idx = 0;
+  var workers = [];
+  for (var w = 0; w < 3 && w < items.length; w++) {
+    workers.push((function(){ return new Promise(function(done){
+      var next = function(){
+        if (idx >= items.length) { done(); return; }
+        var i = idx++;
+        var it = items[i];
+        run(it, i);
+        // 轮询该项完成（XHR 无 Promise，用 setInterval 判断）
+        var timer = setInterval(function(){
+          if (it.state === '完成' || it.state === '失败') { clearInterval(timer); next(); }
+        }, 200);
+      };
+      next();
+    }); })());
+  }
+  Promise.all(workers).then(function(){
+    var done = items.filter(function(it){ return it.state === '完成'; }).length;
+    vStatus('上传完成：成功 ' + done + '/' + items.length);
+    loadVoiceFiles();
+    setTimeout(function(){ voiceUploadListEl.innerHTML = ''; }, 3000);
+  });
+}
+
+document.getElementById('voicePick').addEventListener('click', function(){ voiceFileInput.click(); });
+voiceFileInput.addEventListener('change', function(){ uploadVoiceFiles(voiceFileInput.files); voiceFileInput.value = ''; });
+document.getElementById('voiceRefresh').addEventListener('click', loadVoiceFiles);
+document.getElementById('voiceClear').addEventListener('click', function(){
+  if (!voiceFiles.length) { vStatus('列表已是空的'); return; }
+  if (!window.confirm('清空列表（不删除文件）？')) return;
+  voiceFiles = [];
+  voiceFilesEl.innerHTML = '<div class="empty">（暂无配音）</div>';
+  vStatus('');
+});
+// 拖拽上传
+var voiceCard = document.getElementById('voiceDir');
+voiceDirInput.parentElement.parentElement.addEventListener('dragover', function(e){ e.preventDefault(); });
+voiceDirInput.parentElement.parentElement.addEventListener('drop', function(e){
+  e.preventDefault();
+  if (e.dataTransfer && e.dataTransfer.files) uploadVoiceFiles(e.dataTransfer.files);
+});
+voiceDirInput.addEventListener('change', loadVoiceFiles);
+loadVoiceFiles();
 
 // ===== 剪辑拼接成片 =====
 var matDirInput = document.getElementById('matDir');
@@ -1675,6 +1920,12 @@ function main() {
       handleFiles(urlObj, res);
     } else if (p === '/api/materials') {
       handleMaterials(urlObj, res);
+    } else if (p === '/api/voice/list') {
+      handleVoiceList(urlObj, res);
+    } else if (p === '/api/voice/upload') {
+      handleVoiceUpload(req, res, urlObj);
+    } else if (p === '/api/voice/delete') {
+      handleVoiceDelete(urlObj, res);
     } else if (p === '/api/compose' && req.method === 'POST') {
       handleCompose(req, res).catch((e) => json(res, 500, { error: e.message }));
     } else if (p === '/api/open-folder') {

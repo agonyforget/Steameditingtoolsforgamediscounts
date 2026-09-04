@@ -1,6 +1,9 @@
 # ffmpeg 二进制（约 98MB）不入库：从 Release 附件下载后放入 bin/，或设置 FFMPEG_PATH
 bin/ffmpeg.exe
 
+# 本地 ASR 引擎（sherpa-onnx 运行时 + 模型，约 240MB，不入库）
+sherpa-onnx/
+
 # 运行日志 / 临时文件
 *.log
 Logs/
