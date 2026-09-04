@@ -1077,6 +1077,223 @@ function handleVoiceDelete(urlObj, res) {
   }
 }
 
+// ── 文案 → 字幕（B1：whisper 时间轴 + 文案矫正对齐）───────────────────────────
+
+// 定位 sherpa-onnx 引擎与 whisper 模型（A1 部署在项目内 sherpa-onnx/ 目录）。
+function resolveSherpaOnnx() {
+  const base = path.join(SCRIPT_DIR, 'sherpa-onnx');
+  let exe = null;
+  try {
+    const rt = path.join(base, 'runtime');
+    for (const d of fs.readdirSync(rt)) {
+      const p = path.join(rt, d, 'bin', 'sherpa-onnx-offline.exe');
+      if (fs.existsSync(p)) { exe = p; break; }
+    }
+  } catch { /* ignore */ }
+  const wm = path.join(base, 'models', 'whisper-small-int8');
+  const enc = path.join(wm, 'small-encoder.int8.onnx');
+  const dec = path.join(wm, 'small-decoder.int8.onnx');
+  const tok = path.join(wm, 'small-tokens.txt');
+  return {
+    exe,
+    encoder: enc, decoder: dec, tokens: tok,
+    available: !!(exe && fs.existsSync(enc) && fs.existsSync(dec) && fs.existsSync(tok)),
+  };
+}
+
+// 简繁映射（OpenCC STCharacters.txt，随仓库 lib/ 分发），繁体→简体。
+let SIMP_MAP = null;
+function loadSimpMap() {
+  if (SIMP_MAP) return SIMP_MAP;
+  SIMP_MAP = new Map();
+  try {
+    const text = fs.readFileSync(path.join(SCRIPT_DIR, 'lib', 'STCharacters.txt'), 'utf8');
+    for (const line of text.split(/\r?\n/)) {
+      if (!line || line.startsWith('#')) continue;
+      const cols = line.split(/\s+/);
+      if (cols.length >= 2 && !cols[1].includes('→')) SIMP_MAP.set(cols[0], cols[1]);
+    }
+  } catch { /* 缺表时简繁转换不可用，仅影响繁体匹配 */ }
+  return SIMP_MAP;
+}
+// 文本转简体（whisper 输出常为繁体）。
+function simplifyText(text) {
+  const map = loadSimpMap();
+  if (!map.size) return String(text);
+  let out = '';
+  for (const ch of String(text)) out += map.get(ch) || ch;
+  return out;
+}
+// 归一化：去空白与标点，用于文本比对。
+function normText(text) {
+  return simplifyText(text)
+    .replace(/[\s，。！？、；：""''（）《》【】…—·,.!?;:()<>'"-]/g, '')
+    .toLowerCase();
+}
+
+// 文案分句：按换行 / 句末标点切。
+function splitScriptSentences(script) {
+  const out = [];
+  for (const line of String(script ?? '').split(/\r?\n/)) {
+    const t = line.trim();
+    if (!t) continue;
+    // 按句末标点拆（保留标点），也处理无标点的长行
+    const parts = t.split(/(?<=[。！？!?；;])/);
+    for (const s of parts) {
+      const v = s.trim();
+      if (v) out.push(v);
+    }
+  }
+  return out;
+}
+
+// srt 时间格式 HH:MM:SS,mmm
+function toSrtTime(sec) {
+  sec = Math.max(0, Number(sec) || 0);
+  const h = Math.floor(sec / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  const s = Math.floor(sec % 60);
+  const ms = Math.round((sec % 1) * 1000);
+  const p = (n, l) => String(n).padStart(l, '0');
+  return `${p(h, 2)}:${p(m, 2)}:${p(s, 2)},${p(ms, 3)}`;
+}
+
+// 运行 whisper 识别（sherpa-onnx），结果通过重定向 stdout 到文件获得（沙箱无法用管道捕获）。
+// 输入任意音频路径（内部会先转 wav 由调用方负责）；返回 segments: [{start,end,text}]（text 已转简体）。
+async function runWhisperAsr(wavPath) {
+  const so = resolveSherpaOnnx();
+  if (!so.available) throw new Error('未找到 sherpa-onnx 语音识别引擎（需项目内 sherpa-onnx/models/whisper-small-int8）');
+  const outFile = `${wavPath}.asr.json`;
+  try { fs.rmSync(outFile, { force: true }); } catch { /* ignore */ }
+  const outFd = fs.openSync(outFile, 'w');
+  await new Promise((resolve, reject) => {
+    let child;
+    try {
+      child = spawn(so.exe, [
+        `--whisper-encoder=${so.encoder}`,
+        `--whisper-decoder=${so.decoder}`,
+        `--tokens=${so.tokens}`,
+        '--whisper-language=zh',
+        '--whisper-task=transcribe',
+        '--whisper-enable-segment-timestamps',
+        '--num-threads=6',
+        wavPath,
+      ], { stdio: ['ignore', outFd, outFd], windowsHide: true });
+    } catch (e) {
+      try { fs.closeSync(outFd); } catch { /* ignore */ }
+      return reject(new Error(`无法启动 sherpa-onnx：${e.message}`));
+    }
+    const timer = setTimeout(() => { try { child.kill('SIGKILL'); } catch { /* ignore */ } }, 600000);
+    child.on('error', (e) => { clearTimeout(timer); try { fs.closeSync(outFd); } catch { /* ignore */ } reject(e); });
+    child.on('close', (code) => {
+      clearTimeout(timer);
+      try { fs.closeSync(outFd); } catch { /* ignore */ }
+      resolve(code);
+    });
+  });
+  let content = '';
+  try { content = fs.readFileSync(outFile, 'utf8'); } catch { /* ignore */ }
+  const segments = [];
+  for (const line of content.split(/\r?\n/)) {
+    const l = line.trim();
+    if (!l.startsWith('{')) continue;
+    try {
+      const j = JSON.parse(l);
+      const ts = j.segment_timestamps || [];
+      const du = j.segment_durations || [];
+      const texts = j.segment_texts || [];
+      for (let i = 0; i < texts.length; i++) {
+        segments.push({
+          start: Number(ts[i]) || 0,
+          end: (Number(ts[i]) || 0) + (Number(du[i]) || 0),
+          text: simplifyText(String(texts[i])).trim(),
+        });
+      }
+    } catch { /* ignore */ }
+  }
+  try { fs.rmSync(outFile, { force: true }); } catch { /* ignore */ }
+  if (!segments.length) throw new Error('语音识别没有产出结果（音频可能不是清晰人声）');
+  return segments;
+}
+
+// 把文案句子按顺序映射到 whisper 时间轴上（匀速朗读假设 + 就近吸附段边界）。
+// 返回 [{ text, start, end }]。
+function alignScriptToSegments(sentences, segments) {
+  const totalDur = segments.length ? segments[segments.length - 1].end : 0;
+  const norm = (s) => normText(s).length || 1;
+  const lens = sentences.map(norm);
+  const totalLen = lens.reduce((a, b) => a + b, 0);
+  const out = [];
+  let segIdx = 0;
+  let lastEnd = 0;
+  for (let i = 0; i < sentences.length; i++) {
+    const expDur = (lens[i] / totalLen) * totalDur; // 期望时长（匀速假设）
+    const start = segIdx < segments.length ? segments[segIdx].start : lastEnd;
+    let acc = 0;
+    let guard = 0;
+    // 分配 whisper 段给本句：累计段时长达到期望即停（避免抢下句的段）
+    while (segIdx < segments.length && acc < expDur * 0.85 && guard++ < segments.length) {
+      const segStart = Math.max(segments[segIdx].start, start);
+      acc += Math.max(0, segments[segIdx].end - segStart);
+      segIdx++;
+    }
+    let end = segIdx < segments.length ? segments[segIdx].start : (segments.length ? segments[segments.length - 1].end : lastEnd);
+    end = Math.max(end, start + 0.3);
+    out.push({ text: sentences[i], start: Math.round(start * 100) / 100, end: Math.round(end * 100) / 100 });
+    lastEnd = end;
+  }
+  return out;
+}
+
+// 生成 srt 文本。
+function buildSrt(cues) {
+  return cues.map((c, i) => `${i + 1}\n${toSrtTime(c.start)} --> ${toSrtTime(c.end)}\n${c.text}`).join('\n\n') + '\n';
+}
+
+// POST /api/subtitle/generate ：{ voiceFile, script, voiceDir? } → 生成 <配音名>.srt
+async function handleSubtitleGenerate(req, res) {
+  let payload;
+  try {
+    payload = JSON.parse(await readBody(req));
+  } catch {
+    return json(res, 400, { error: '请求体不是合法 JSON' });
+  }
+  const voiceName = String(payload.voiceFile || '').trim();
+  const script = String(payload.script || '').trim();
+  const dir = String(payload.voiceDir || '').trim() || DEFAULT_VOICE_DIR;
+  if (!voiceName || voiceName.includes('..') || voiceName.includes('/') || voiceName.includes('\\')) {
+    return json(res, 400, { error: '请选择配音文件' });
+  }
+  if (!script) return json(res, 400, { error: '请粘贴文案内容' });
+  const voicePath = path.join(dir, voiceName);
+  if (!fs.existsSync(voicePath)) return json(res, 404, { error: `配音文件不存在：${voiceName}` });
+  const ff = resolveFfmpeg();
+  if (!ff) return json(res, 500, { error: '未找到 ffmpeg' });
+  const sentences = splitScriptSentences(script);
+  if (!sentences.length) return json(res, 400, { error: '文案为空或无法分句' });
+
+  const tmpDir = path.join(dir, `.subtitle_tmp_${Date.now()}`);
+  fs.mkdirSync(tmpDir, { recursive: true });
+  try {
+    // 1) 转 16k 单声道 wav（sherpa-onnx 输入）
+    const wav = path.join(tmpDir, 'voice.wav');
+    await runLocal(ff, ['-y', '-loglevel', 'error', '-i', voicePath, '-ar', '16000', '-ac', '1', '-c:a', 'pcm_s16le', wav], { timeoutMs: 120000 });
+    // 2) whisper 识别（带句级时间戳）
+    const segments = await runWhisperAsr(wav);
+    // 3) 文案句子 ↔ 时间轴对齐
+    const cues = alignScriptToSegments(sentences, segments);
+    // 4) 生成并保存 srt（与配音同名）
+    const srtText = buildSrt(cues);
+    const srtFile = path.join(dir, voiceName.replace(/\.[^.]+$/, '') + '.srt');
+    fs.writeFileSync(srtFile, srtText, 'utf8');
+    return json(res, 200, { ok: true, srtFile, srt: srtText, cues });
+  } catch (e) {
+    return json(res, 502, { error: `字幕生成失败：${e.message}` });
+  } finally {
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch { /* ignore */ }
+  }
+}
+
 // GET /api/materials?dir=... ：列出素材目录的 mp4（附带解析出的游戏名）。
 function handleMaterials(urlObj, res) {
   const dir = urlObj.searchParams.get('dir') || DEFAULT_DIR;
@@ -1236,6 +1453,27 @@ https://store.steampowered.com/app/648800/Raft/"></textarea>
     <h2 style="font-size:14px;margin:0 0 6px">已上传配音（按 01/02/03 顺序排列）</h2>
     <div id="voiceFiles"><div class="empty">（暂无配音，先上传）</div></div>
   </div>
+</div>
+
+<div class="card">
+  <h2>📝 文案 → 字幕</h2>
+  <div class="sub" style="margin:0 0 8px">
+    选择一段配音 + 粘贴（或载入）对应的文案 → 程序用本地语音识别拿到<strong>时间轴</strong>（whisper，含句级时间戳），
+    再用你的文案<strong>矫正错字</strong>，生成 .srt 字幕。文案会自动分句，识别约需数秒到一分钟（配音越长越久）。
+  </div>
+  <div class="row">
+    <select id="subVoiceSel" style="flex:1;min-width:200px"></select>
+  </div>
+  <label for="subScript" style="margin-top:10px">文案内容（每行一句或用标点分句均可）</label>
+  <textarea id="subScript" placeholder="粘贴这里：例如&#10;幻兽帕鲁，一款开放世界的生存建造游戏……&#10;今天就介绍到这里，感兴趣的话快去试试吧。"></textarea>
+  <div class="row">
+    <button id="subPickTxt" class="ghost">📄 载入文案文件(.txt)</button>
+    <input type="file" id="subTxtInput" accept=".txt,text/plain" style="display:none" />
+    <button id="subGen" class="accent">🎬 生成字幕</button>
+    <button id="subCopy" class="ghost" style="display:none">📋 复制 srt</button>
+    <span id="subStatus"></span>
+  </div>
+  <div id="subResult"></div>
 </div>
 
 <div class="card">
@@ -1476,6 +1714,7 @@ function loadVoiceFiles() {
       if (res.error) { voiceFilesEl.innerHTML = '<div class="empty">' + esc(res.error) + '</div>'; return; }
       if (!voiceDirInput.value.trim()) voiceDirInput.value = res.dir;
       voiceFiles = res.files;
+      fillSubVoiceSel();
       if (!voiceFiles.length) { voiceFilesEl.innerHTML = '<div class="empty">（暂无配音，先上传）</div>'; return; }
       var html = '';
       voiceFiles.forEach(function(f, i) {
@@ -1485,6 +1724,79 @@ function loadVoiceFiles() {
     })
     .catch(function(e){ voiceFilesEl.innerHTML = '<div class="empty">读取失败：' + esc(e.message) + '</div>'; });
 }
+
+// ===== 文案 → 字幕 =====
+var subVoiceSel = document.getElementById('subVoiceSel');
+var subScriptEl = document.getElementById('subScript');
+var subStatusEl = document.getElementById('subStatus');
+var subResultEl = document.getElementById('subResult');
+var subGenBtn = document.getElementById('subGen');
+var subCopyBtn = document.getElementById('subCopy');
+var lastSrt = '';
+
+function fillSubVoiceSel() {
+  if (!subVoiceSel) return;
+  var cur = subVoiceSel.value;
+  subVoiceSel.innerHTML = '';
+  if (!voiceFiles.length) {
+    subVoiceSel.innerHTML = '<option value="">（请先上传配音）</option>';
+    return;
+  }
+  voiceFiles.forEach(function(f, i) {
+    var opt = document.createElement('option');
+    opt.value = f.name;
+    opt.textContent = '#' + (i + 1) + ' ' + f.name;
+    subVoiceSel.appendChild(opt);
+  });
+  if (cur) subVoiceSel.value = cur;
+}
+function subStatus(t) { if (subStatusEl) subStatusEl.textContent = t || ''; }
+
+document.getElementById('subPickTxt').addEventListener('click', function(){ document.getElementById('subTxtInput').click(); });
+document.getElementById('subTxtInput').addEventListener('change', function(ev){
+  var f = ev.target.files && ev.target.files[0];
+  if (!f) return;
+  var rd = new FileReader();
+  rd.onload = function(){ subScriptEl.value = rd.result; subStatus('已载入文案文件：' + f.name); };
+  rd.readAsText(f);
+  ev.target.value = '';
+});
+
+subGenBtn.addEventListener('click', function(){
+  var voiceFile = subVoiceSel.value;
+  var script = subScriptEl.value.trim();
+  if (!voiceFile) { subStatus('请先选择配音'); return; }
+  if (!script) { subStatus('请粘贴文案内容'); return; }
+  subGenBtn.disabled = true;
+  subStatus('识别中……（配音时长 1 倍约 1~3 倍耗时，请稍候）');
+  subResultEl.innerHTML = '';
+  fetch('/api/subtitle/generate', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ voiceFile: voiceFile, script: script, voiceDir: voiceDirVal() })
+  })
+    .then(function(r){ return r.json(); })
+    .then(function(res){
+      subGenBtn.disabled = false;
+      if (res.error) { subStatus('生成失败'); subResultEl.innerHTML = '<div class="errmsg">' + esc(res.error) + '</div>'; return; }
+      lastSrt = res.srt;
+      subStatus('完成 ✓');
+      var html = '<div class="meta" style="color:#1a7a3a;margin-top:6px">✅ 字幕已保存：<b>' + esc(res.srtFile) + '</b>（共 ' + res.cues.length + ' 句）</div>';
+      html += '<pre style="white-space:pre-wrap;max-height:260px;overflow:auto">' + esc(res.srt) + '</pre>';
+      subResultEl.innerHTML = html;
+      subCopyBtn.style.display = 'inline-block';
+    })
+    .catch(function(e){ subGenBtn.disabled = false; subStatus('生成失败'); subResultEl.innerHTML = '<div class="errmsg">请求失败：' + esc(e.message) + '</div>'; });
+});
+
+subCopyBtn.addEventListener('click', function(){
+  if (!lastSrt) return;
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(lastSrt).then(function(){ subStatus('已复制到剪贴板'); });
+  } else {
+    window.prompt('请手动复制（Ctrl+C）：', lastSrt);
+  }
+});
 
 function deleteVoiceFile(i) {
   var f = voiceFiles[i];
@@ -1926,6 +2238,8 @@ function main() {
       handleVoiceUpload(req, res, urlObj);
     } else if (p === '/api/voice/delete') {
       handleVoiceDelete(urlObj, res);
+    } else if (p === '/api/subtitle/generate' && req.method === 'POST') {
+      handleSubtitleGenerate(req, res).catch((e) => json(res, 500, { error: e.message }));
     } else if (p === '/api/compose' && req.method === 'POST') {
       handleCompose(req, res).catch((e) => json(res, 500, { error: e.message }));
     } else if (p === '/api/open-folder') {
