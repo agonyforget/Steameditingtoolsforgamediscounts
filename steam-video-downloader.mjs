@@ -1681,9 +1681,13 @@ function openDir() {
 // 加载配置（默认目录 + 内置引擎状态）
 fetch('/api/config').then(function(r){ return r.json(); }).then(function(res){
   if (!dirInput.value.trim()) dirInput.value = res.dir;
-  if (res.ffmpeg && res.builtin) engineInfo.textContent = '✅ HLS 解析下载已内置（Node），合并引擎：内置 ffmpeg（' + res.ffmpeg + '），无需配置任何外部工具';
-  else if (res.ffmpeg) engineInfo.textContent = '✅ HLS 解析下载已内置（Node），合并引擎：系统 ffmpeg（' + res.ffmpeg + '）';
-  else engineInfo.textContent = '⚠️ 未找到 ffmpeg（请检查工具目录 bin\\ 或本机安装），下载合并将不可用';
+  var parts = [];
+  if (res.ffmpeg && res.builtin) parts.push('✅ HLS 解析下载已内置（Node），合并引擎：内置 ffmpeg');
+  else if (res.ffmpeg) parts.push('✅ HLS 解析下载已内置（Node），合并引擎：系统 ffmpeg');
+  else parts.push('⚠️ 未找到 ffmpeg（下载合并将不可用）');
+  if (res.asrAvailable) parts.push('🎙️ ' + res.asrDetail);
+  else parts.push('🎙️ ⚠️ ' + res.asrDetail);
+  engineInfo.textContent = parts.join('　|　');
   refreshFiles();
 }).catch(function(){});
 
@@ -2076,7 +2080,15 @@ function readBody(req) {
 function handleConfig(res) {
   const ff = resolveFfmpeg();
   const builtin = !!ff && ff.startsWith(path.join(SCRIPT_DIR, 'bin'));
-  return json(res, 200, { dir: DEFAULT_DIR, ffmpeg: ff || '', builtin });
+  const asr = resolveSherpaOnnx();
+  return json(res, 200, {
+    dir: DEFAULT_DIR,
+    voiceDir: DEFAULT_VOICE_DIR,
+    ffmpeg: ff || '',
+    builtin,
+    asrAvailable: asr.available,
+    asrDetail: asr.available ? '本地语音识别已就绪（sherpa-onnx + Whisper int8）' : '未安装语音识别引擎（字幕功能不可用：请从 Release 下载 sherpa-asr-win-x64.zip 解压到项目根目录）',
+  });
 }
 
 // POST /api/download：创建下载任务。

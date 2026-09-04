@@ -38,6 +38,16 @@
 
 > 备选：自行安装 ffmpeg（如 gyan.dev 或 winget install ffmpeg）后设置 `FFMPEG_PATH`，无需 `bin\`。
 
+### 📥 获取本地语音识别引擎（"文案 → 字幕"功能需要）
+
+字幕功能（配音 → 时间轴）使用本地 **sherpa-onnx + Whisper small int8** 引擎（中文，纯 CPU，约 360MB），按 Release 附件提供（不入 Git 仓库）：
+
+1. 前往本项目的 **Releases** 页面，下载 `sherpa-asr-win-x64.zip`
+2. 解压，得到 `sherpa-onnx\` 文件夹，**放入项目根目录**（与 `steam-video-downloader.mjs` 同级）
+3. 重启工具，网页「📝 文案 → 字幕」即可使用
+
+> 若未安装引擎，字幕生成会提示"未找到 sherpa-onnx 语音识别引擎"，其余功能不受影响。
+
 ---
 
 ## 🚀 快速开始
