@@ -1042,9 +1042,18 @@ function handleVoiceUpload(req, res, urlObj) {
     return json(res, 400, { error: `无法创建配音目录：${e.message}` });
   }
   const target = path.join(dir, name);
-  // 先写临时 .part，完整接收成功后才落为正式文件：
-  // 网络中断/出错只清理半成品，绝不破坏可能已存在的正式文件。
-  const part = `${target}.part`;
+  // Windows 文件名预检：非法字符 / 尾随点空格 / 系统保留名 → 提前友好报错（否则落盘时神秘失败）
+  const illegal = name.match(/[<>:"|?*\u0000-\u001f]/);
+  if (illegal) return json(res, 400, { error: `文件名包含 Windows 不允许的字符「${illegal[0]}」，请改名后再上传` });
+  if (/[. ]$/.test(name)) return json(res, 400, { error: '文件名不能以点或空格结尾，请改名后再上传' });
+  const stemUp = name.replace(/\.[^.]+$/, '').toUpperCase();
+  if (/^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])$/.test(stemUp)) {
+    return json(res, 400, { error: `「${name}」是 Windows 系统保留名，请改名后再上传` });
+  }
+  // 临时文件带随机 token：多个请求即使同名也各写各的临时文件，互不截断/互不破坏。
+  // 网络中断/出错只清理自己的半成品，绝不破坏可能已存在的正式文件。
+  const token = randomUUID().slice(0, 8);
+  const part = `${target}.${token}.part`;
   let responded = false;
   const fail = (code, msg) => {
     if (responded) return;
@@ -1053,21 +1062,30 @@ function handleVoiceUpload(req, res, urlObj) {
     try { fs.rmSync(part, { force: true }); } catch { /* ignore */ }
     return json(res, code, { error: msg });
   };
-  const ws = fs.createWriteStream(part);
-  req.pipe(ws);
-  ws.on('finish', () => {
+  // 提交落盘：Windows rename 不能覆盖已存在文件 → 先删旧文件再改名。
+  // 文件可能被剪映/播放器/资源管理器预览短暂占用，删除/改名失败自动重试数次。
+  const commitFile = (attemptLeft) => {
     if (responded) return;
     try {
-      // 覆盖同名正式文件前先删旧文件（Windows rename 不允许覆盖）
-      try { if (fs.existsSync(target)) fs.rmSync(target, { force: true }); } catch { /* ignore */ }
+      if (fs.existsSync(target)) fs.rmSync(target, { force: true });
       fs.renameSync(part, target);
       const st = fs.statSync(target);
       responded = true;
+      try { fs.rmSync(part, { force: true }); } catch { /* ignore */ }
+      cleanupVoiceOrphans(dir); // 顺带清理历史中断残留的 .part
       return json(res, 200, { ok: true, name, size: st.size });
     } catch (e) {
-      return fail(500, `保存失败：${e.message}`);
+      if (attemptLeft > 0 && !responded) {
+        setTimeout(() => commitFile(attemptLeft - 1), 500);
+        return;
+      }
+      const busy = e.code === 'EPERM' || e.code === 'EBUSY' || e.code === 'EACCES' || e.code === 'ENOTEMPTY';
+      return fail(500, `保存失败：${e.message}${busy ? '（文件可能正被剪映/播放器/资源管理器等程序占用，请关闭后点"重试"）' : ''}`);
     }
-  });
+  };
+  const ws = fs.createWriteStream(part);
+  req.pipe(ws);
+  ws.on('finish', () => commitFile(4));
   ws.on('error', (e) => fail(500, `写入失败：${e.message}`));
   req.on('aborted', () => fail(400, '上传中断（连接被断开）'));
   req.on('error', () => fail(400, '上传中断（请求错误）'));
@@ -1081,6 +1099,18 @@ function handleVoiceUpload(req, res, urlObj) {
     }
   }, 30000);
   req.on('end', () => clearInterval(idleTimer));
+}
+
+// 清理配音目录里历史中断/崩溃遗留的 .part 半成品（只删超过 1 小时的，避免误删正在上传中的）。
+function cleanupVoiceOrphans(dir) {
+  try {
+    const now = Date.now();
+    for (const f of fs.readdirSync(dir)) {
+      if (!f.endsWith('.part')) continue;
+      const p = path.join(dir, f);
+      try { if (now - fs.statSync(p).mtimeMs > 3600000) fs.rmSync(p, { force: true }); } catch { /* ignore */ }
+    }
+  } catch { /* ignore */ }
 }
 
 // GET /api/voice/delete?name=xx.mp3&dir=... ：删除一个配音文件。
@@ -3193,6 +3223,13 @@ function uploadVoiceFiles(fileList) {
   var files = Array.prototype.slice.call(fileList || []).filter(function(f){ return isVoiceExt(f.name); });
   var bad = (fileList ? fileList.length : 0) - files.length;
   if (!files.length) { vStatus('没有可上传的音频文件（支持 mp3/wav/m4a/aac/flac/ogg/wma/opus）'); return; }
+  // 同批重名检查：两个同名文件会互相覆盖，先提示用户处理
+  var seen = Object.create(null);
+  for (var i = 0; i < files.length; i++) {
+    var nm = files[i].name;
+    if (seen[nm]) { vStatus('同批存在重名文件「' + nm + '」：后上传的会覆盖先前的，请改名或分开上传'); return; }
+    seen[nm] = true;
+  }
   var dir = voiceDirVal();
   files.forEach(function(f){
     voiceUploadItems.push({ f: f, state: '排队', pct: 0, size: 0, err: '', tries: 0 });
