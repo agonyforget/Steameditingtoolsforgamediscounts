@@ -1989,6 +1989,336 @@ async function handleSteamCards(req, res) {
   return json(res, 200, { ok: true, rows, errs });
 }
 
+// ── C2：片尾省流总表渲染 / 素材混剪 ─────────────────────────────────────────
+
+// 用游戏数据渲染"片尾省流总表"画面段（1920x1080 静态列表视频，dur 秒）。
+// rows: [{name, now, discount, rating}]（rating 0.95 或 "95.00%"）
+async function renderTableVideo(rows, dur, outPath) {
+  const ff = resolveFfmpeg();
+  const titleFont = resolveCnFont(true);
+  const bodyFont = resolveCnFont(false);
+  if (!titleFont || !bodyFont) throw new Error('未找到中文字体');
+  const n = rows.length;
+  const topY = 200;
+  const bottomY = 1040;
+  const rowH = n > 0 ? Math.min(88, Math.max(56, (bottomY - topY) / n)) : 88;
+  const parts = [];
+  parts.push('drawbox=x=0:y=0:w=1920:h=1080:color=0x0E1116@1:t=fill');
+  parts.push(`drawtext=fontfile='${escF(titleFont)}':text='${escF('本期 Steam 史低推荐')}':x=80:y=70:fontsize=64:fontcolor=0xFFFFFF`);
+  const rate = (v) => {
+    const s = String(v ?? '').trim();
+    if (!s) return '';
+    if (s.includes('%')) return s;
+    const num = Number(s);
+    if (Number.isNaN(num)) return s;
+    const p = num <= 1 ? num * 100 : num;
+    return `${p.toFixed(0)}%`;
+  };
+  const price = (v) => (v ? `¥${v}` : '');
+  const safe = (s) => String(s ?? '').replace(/%/g, '％'); // 半角%换全角，规避 drawtext 转义
+  rows.forEach((r, i) => {
+    const y = topY + i * rowH;
+    const name = safe(String(r.name || '').slice(0, 24));
+    const now = safe(price(r.now));
+    const disc = safe(String(r.discount || ''));
+    const rat = safe(rate(r.rating));
+    parts.push(`drawtext=fontfile='${escF(bodyFont)}':text='${escF(name)}':x=100:y=${y}:fontsize=44:fontcolor=0xFFFFFF`);
+    if (now) parts.push(`drawtext=fontfile='${escF(bodyFont)}':text='${escF(now)}':x=1180:y=${y}:fontsize=44:fontcolor=0x7EE787`);
+    if (disc) parts.push(`drawtext=fontfile='${escF(bodyFont)}':text='${escF(disc)}':x=1400:y=${y}:fontsize=44:fontcolor=0xEF5350`);
+    if (rat) parts.push(`drawtext=fontfile='${escF(bodyFont)}':text='${escF(rat)}':x=1660:y=${y}:fontsize=44:fontcolor=0xFFD54F`);
+    if (i < n - 1) parts.push(`drawbox=x=100:y=${y + rowH - 6}:w=1700:h=2:color=0x33383F@1:t=fill`);
+  });
+  const chain = `[0:v]${parts.join(',')}[vout]`;
+  const args = ['-y', '-loglevel', 'error', '-f', 'lavfi', '-i', `color=black:s=1920x1080:d=${dur}:r=30`, '-filter_complex', chain, '-map', '[vout]', '-c:v', 'libx264', '-crf', '20', '-preset', 'medium', '-pix_fmt', 'yuv420p', outPath];
+  await runLocal(ff, args, { timeoutMs: 180000 });
+}
+
+// 计算"正片未用区间"（素材 free ranges）：given used [{s,e}] in [0,dur]
+function freeRanges(dur, used) {
+  const segs = [];
+  let cur = 0;
+  const us = (used || []).slice().sort((a, b) => a.s - b.s);
+  for (const u of us) {
+    if (u.s > cur + 0.5) segs.push({ s: cur, e: u.s });
+    cur = Math.max(cur, u.e);
+  }
+  if (dur - cur > 0.5) segs.push({ s: cur, e: dur });
+  return segs;
+}
+
+// 从素材选取未用片段用于混剪：贪心凑满 targetDur（同一未用区间可切多段）。
+// clips: [{path, s, e}] 顺序即混剪顺序
+function pickFreeClips(materialsUsed, targetDur, clipLen) {
+  const clips = [];
+  let acc = 0;
+  for (const m of materialsUsed) {
+    if (acc >= targetDur - 0.2) break;
+    const fr = freeRanges(m.dur, m.used);
+    for (const f of fr) {
+      let pos = f.s;
+      while (pos < f.e - 0.5 && acc < targetDur - 0.2) {
+        const need = targetDur - acc;
+        const avail = f.e - pos;
+        let take = Math.min(clipLen, avail);
+        if (need > 0.5 && need < take) take = need; // 末段补精确到目标
+        if (take < 0.5) break;
+        clips.push({ path: m.path, s: pos, e: pos + take });
+        acc += take;
+        pos += take;
+      }
+    }
+  }
+  return { clips, acc };
+}
+
+// 生成混剪视频：把 clips（未用片段）硬切快剪拼接成一段（无音轨，统一 30fps 重编码）。
+async function renderMontage(clips, outPath) {
+  const ff = resolveFfmpeg();
+  if (!clips.length) throw new Error('没有可用的素材片段做混剪');
+  const tmpDir = path.join(SCRIPT_DIR, `.tmp_mont_${Date.now()}_${randomUUID().slice(0, 8)}`);
+  fs.mkdirSync(tmpDir, { recursive: true });
+  try {
+    const ins = [];
+    const fc = [];
+    clips.forEach((c, i) => {
+      const clip = path.join(tmpDir, `m${i}.mp4`);
+      ins.push('-i', c.path);
+      fc.push(`[${i}:v]trim=start=${c.s}:end=${c.e},setpts=PTS-STARTPTS,fps=30,format=yuv420p[v${i}]`);
+    });
+    // 硬切串联（快剪感）：用 concat filter
+    let prev = 'v0';
+    for (let i = 1; i < clips.length; i++) {
+      fc.push(`[${prev}][v${i}]concat=n=2:v=1:a=0[vx${i}]`);
+      prev = `vx${i}`;
+    }
+    fc.push(`[${prev}]format=yuv420p[vout]`);
+    const args = ['-y', '-loglevel', 'error', ...ins, '-filter_complex', fc.join(';'), '-map', '[vout]', '-c:v', 'libx264', '-crf', '20', '-preset', 'medium', '-pix_fmt', 'yuv420p', outPath];
+    await runLocal(ff, args, { timeoutMs: 600000 });
+  } finally {
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch { /* ignore */ }
+  }
+}
+
+// ── C2：完整时间线合成（片头混剪 + 正片 + 片尾混剪 + 片尾总表）───────────────
+// body: {
+//   voices:    [开场白01, 解说1, 解说2...]   配音顺序（01=片头开场白）
+//   materials: [{path, start?} 解说1..k 的素材段]  （数量 = 解说数）
+//   games:     [ {name,now,discount,rating,...} ] 游戏数据（数量=解说数，用于片尾总表，可选）
+//   padding, transition, fps, tailSeconds=6, tableSeconds=8, outDir, outName?
+// }
+async function handleComposeTimeline(req, res) {
+  let payload;
+  try {
+    payload = JSON.parse(await readBody(req));
+  } catch {
+    return json(res, 400, { error: '请求体不是合法 JSON' });
+  }
+  const voices = Array.isArray(payload.voices) ? payload.voices : [];
+  const materials = Array.isArray(payload.materials) ? payload.materials : [];
+  const games = Array.isArray(payload.games) ? payload.games : [];
+  if (!voices.length) return json(res, 400, { error: '请至少选择一段配音（01 为片头开场白）' });
+  if (!materials.length) return json(res, 400, { error: '请选择正片素材' });
+
+  // 配音 01 = 开场白（当 voices 比 materials 多一个时）
+  const hasHead = voices.length === materials.length + 1;
+  const segVoices = hasHead ? voices.slice(1) : voices;
+  if (segVoices.length !== materials.length) {
+    return json(res, 400, { error: `配音(${voices.length}) 需比素材(${materials.length})多一段开场白，或两者数量一致` });
+  }
+  if (games.length && games.length !== materials.length) {
+    return json(res, 400, { error: `游戏数据(${games.length})与素材段(${materials.length})数量不一致` });
+  }
+
+  const padding = Math.max(0, Number(payload.padding) || 2);
+  const transition = Math.max(0, Number(payload.transition) || 0);
+  const fps = Math.min(60, Math.max(12, Number(payload.fps) || 30));
+  const tailSeconds = Math.max(0, Number(payload.tailSeconds) || 6);
+  const tableSeconds = Math.max(0, Number(payload.tableSeconds) || 8);
+  const outDir = String(payload.outDir || '').trim() || 'E:/worddeepseek/videocut/product';
+  const ff = resolveFfmpeg();
+  if (!ff) return json(res, 500, { error: '未找到 ffmpeg' });
+  try { fs.mkdirSync(outDir, { recursive: true }); } catch (e) { return json(res, 400, { error: `无法创建成品目录：${e.message}` }); }
+
+  const tmpDir = path.join(SCRIPT_DIR, `.tmp_tl_${Date.now()}_${randomUUID().slice(0, 8)}`);
+  fs.mkdirSync(tmpDir, { recursive: true });
+  let ok = false;
+
+  try {
+    const k = materials.length;
+    // 1) 各正片段配音时长与段长
+    const segDurs = [];
+    const segFiles = [];
+    const materialsUsed = [];
+    for (let i = 0; i < k; i++) {
+      const mat = String(materials[i].path || '').trim();
+      const voice = String(segVoices[i].path || '').trim();
+      if (!fs.existsSync(mat)) throw new Error(`素材不存在：${mat}`);
+      if (!fs.existsSync(voice)) throw new Error(`配音不存在：${voice}`);
+      const start = Math.max(0, Number(materials[i].start) || 0);
+      const tVoice = await voiceDurationOf(voice);
+      const segLen = tVoice + padding;
+      const matDur = await runFfDuration(mat);
+      if (start + segLen > matDur + 0.5) throw new Error(`素材 ${i + 1} 不够剪`);
+      const clip = path.join(tmpDir, `seg${i}.mp4`);
+      await runLocal(ff, ['-y', '-loglevel', 'error', '-ss', String(start), '-i', mat, '-t', String(segLen), '-an', '-c:v', 'copy', '-avoid_negative_ts', 'make_zero', clip], { timeoutMs: 120000 });
+      segFiles.push(clip);
+      segDurs.push(segLen);
+      materialsUsed.push({ path: mat, dur: matDur, used: [{ s: start, e: start + segLen }] });
+    }
+
+    // 2) 计划段序列（时长）
+    const headVoicePath = hasHead ? String(voices[0].path || '') : '';
+    if (hasHead && !fs.existsSync(headVoicePath)) throw new Error(`开场白配音不存在：${headVoicePath}`);
+    const headDur = hasHead ? (await voiceDurationOf(headVoicePath)) + 1 : 0;
+    const tailDur = tailSeconds;
+    const tableDur = games.length ? tableSeconds : 0;
+    const durs = []; // 段序列时长
+    if (hasHead) durs.push(headDur);
+    segDurs.forEach((d) => durs.push(d));
+    if (tailDur > 0) durs.push(tailDur);
+    if (tableDur > 0) durs.push(tableDur);
+    const nSeg = durs.length;
+    if (!nSeg) throw new Error('没有可合成的段落');
+
+    // 3) 生成片头/片尾混剪 与 片尾总表 画面文件
+    const fileList = [];
+    if (hasHead) {
+      const { clips, acc } = pickFreeClips(materialsUsed, headDur, 2.5);
+      if (acc < headDur - 1) throw new Error(`素材未用片段不足（凑到 ${acc.toFixed(1)}s / 需 ${headDur.toFixed(1)}s）：请提供更多/更长的素材`);
+      const f = path.join(tmpDir, 'head.mp4');
+      await renderMontage(clips, f);
+      fileList.push(f);
+    }
+    segFiles.forEach((f) => fileList.push(f));
+    if (tailDur > 0) {
+      const { clips, acc } = pickFreeClips(materialsUsed, tailDur, 2.5);
+      if (acc < tailDur - 1) throw new Error('素材未用片段不足以制作片尾混剪');
+      const f = path.join(tmpDir, 'tail.mp4');
+      await renderMontage(clips, f);
+      fileList.push(f);
+    }
+    if (tableDur > 0) {
+      const f = path.join(tmpDir, 'table.mp4');
+      await renderTableVideo(games, tableDur, f);
+      fileList.push(f);
+    }
+
+    // 4) 画面合成：统一 fps -> xfade（转场）或 concat（硬切）
+    const video = path.join(tmpDir, 'video.mp4');
+    const ins = ['-y', '-loglevel', 'error'];
+    fileList.forEach((f) => ins.push('-i', f));
+    const fc = [];
+    fileList.forEach((_, i) => fc.push(`[${i}:v]fps=${fps},format=yuv420p[v${i}]`));
+    if (transition > 0 && nSeg > 1) {
+      const accOf = (p) => durs.slice(0, p).reduce((a, b) => a + b, 0);
+      let prev = 'v0';
+      for (let p = 1; p < nSeg; p++) {
+        const offset = accOf(p) - p * transition;
+        fc.push(`[${prev}][v${p}]xfade=transition=fade:duration=${transition.toFixed(3)}:offset=${offset.toFixed(3)}[x${p}]`);
+        prev = `x${p}`;
+      }
+      fc.push(`[${prev}]format=yuv420p[vout]`);
+    } else {
+      // 硬切：filter concat（统一帧率后串联）
+      let prev = 'v0';
+      for (let i = 1; i < nSeg; i++) {
+        fc.push(`[${prev}][v${i}]concat=n=2:v=1:a=0[vx${i}]`);
+        prev = `vx${i}`;
+      }
+      fc.push(`[${prev}]format=yuv420p[vout]`);
+    }
+    ins.push('-filter_complex', fc.join(';'), '-map', '[vout]', '-c:v', 'libx264', '-crf', '18', '-preset', 'medium', '-pix_fmt', 'yuv420p', video);
+    const vErrFile = path.join(SCRIPT_DIR, `.tmp_tlerr_${Date.now()}_${randomUUID().slice(0, 8)}.txt`);
+    try {
+      const errFd = fs.openSync(vErrFile, 'w');
+      try {
+        await new Promise((resolve, reject) => {
+          let child;
+          try {
+            child = spawn(ff, ins, { stdio: ['ignore', 'ignore', errFd], windowsHide: true });
+          } catch (e2) { return reject(e2); }
+          child.on('error', reject);
+          child.on('close', (code) => (code === 0 ? resolve() : reject(new Error(`退出码 ${code}`))));
+        });
+      } finally {
+        try { fs.closeSync(errFd); } catch { /* ignore */ }
+      }
+    } catch (e2) {
+      let det = e2.message;
+      try {
+        const t = fs.readFileSync(vErrFile, 'utf8');
+        const ls = t.split(/\r?\n/).filter((l) => l.trim()).slice(-6).join(' | ');
+        if (ls) det += ` ｜ ffmpeg: ${ls}`;
+      } catch { /* ignore */ }
+      throw new Error(det);
+    } finally {
+      try { fs.rmSync(vErrFile, { force: true }); } catch { /* ignore */ }
+    }
+    if (!fs.existsSync(video)) throw new Error('画面合成失败');
+
+    // 5) 配音贴入：开场白@0；解说 i 在段序列位置 1(或0)+i
+    const totalDur = durs.reduce((a, b) => a + b, 0) - (nSeg > 1 ? (nSeg - 1) * transition : 0);
+    const accOfD = (p) => durs.slice(0, p).reduce((a, b) => a + b, 0);
+    const posOf = (listIdx) => (hasHead ? 1 + listIdx : listIdx); // 解说 i 的段序列位置
+    const delaySec = (pos) => (pos === 0 ? 0 : accOfD(pos) - pos * transition);
+    const delays = [];
+    if (hasHead) delays.push({ voice: headVoicePath, ms: 0 });
+    segVoices.forEach((v, i) => delays.push({ voice: v.path, ms: Math.max(0, Math.round(delaySec(posOf(i)) * 1000)) }));
+
+    const baseName = (payload.outName && String(payload.outName).trim())
+      ? String(payload.outName).trim()
+      : `${todayStr()}_完整成片`;
+    const dest = uniquePath(path.join(outDir, `${sanitizeName(baseName)}.mp4`));
+    const aargs = ['-y', '-loglevel', 'error', '-i', video, '-f', 'lavfi', '-i', 'anullsrc=r=44100:cl=stereo'];
+    delays.forEach((d) => aargs.push('-i', d.voice));
+    const afc = [];
+    afc.push(`[1:a]atrim=0:${totalDur.toFixed(3)},asetpts=PTS-STARTPTS[base]`);
+    delays.forEach((d, j) => {
+      const idx = 2 + j;
+      afc.push(`[${idx}:a]aformat=sample_rates=44100:channel_layouts=stereo,adelay=${d.ms}|${d.ms}[vo${j}]`);
+    });
+    const inputs = ['[base]'].concat(delays.map((_, j) => `[vo${j}]`)).join('');
+    afc.push(`${inputs}amix=inputs=${1 + delays.length}:duration=longest:normalize=0[aout]`);
+    aargs.push('-filter_complex', afc.join(';'), '-map', '0:v', '-map', '[aout]', '-c:v', 'copy', '-c:a', 'aac', '-b:a', '192k', dest);
+    await runLocal(ff, aargs, { timeoutMs: 600000 });
+    if (!fs.existsSync(dest)) throw new Error('合成失败（未生成文件）');
+
+    // 6) 返回段落窗口（供卡片叠加 / 调试）
+    let segIdx = 0;
+    const windows = [];
+    const addWin = (label, pos, dur) => {
+      const s = delaySec(pos);
+      windows.push({ label, index: windows.length + 1, startMs: Math.max(0, Math.round(s * 1000)), endMs: Math.round((s + dur) * 1000) });
+    };
+    let pos = 0;
+    if (hasHead) { addWin('片头', pos, headDur); pos++; }
+    for (let i = 0; i < k; i++) { addWin(`游戏${i + 1}`, pos, segDurs[i]); pos++; }
+    if (tailDur > 0) { addWin('片尾', pos, tailDur); pos++; }
+    if (tableDur > 0) { addWin('省流总表', pos, tableDur); }
+
+    const st = fs.statSync(dest);
+    ok = true;
+    return json(res, 200, {
+      ok: true,
+      output: dest,
+      size: st.size,
+      duration: Math.round(totalDur * 100) / 100,
+      transition,
+      hasHead,
+      windows,
+      segments: windows,
+    });
+  } catch (e) {
+    let tmpList = '';
+    try { tmpList = ' | tmp:' + fs.readdirSync(tmpDir).join(','); } catch { /* ignore */ }
+    return json(res, 502, { error: `完整成片失败：${e.message}${tmpList}`, tmpDir: ok ? '' : tmpDir });
+  } finally {
+    if (ok) {
+      try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch { /* ignore */ }
+    }
+  }
+}
+
 // GET /api/materials?dir=... ：列出素材目录的 mp4（附带解析出的游戏名）。
 function handleMaterials(urlObj, res) {
   const dir = urlObj.searchParams.get('dir') || DEFAULT_DIR;
@@ -3405,6 +3735,8 @@ function main() {
       handleSteamCards(req, res).catch((e) => json(res, 500, { error: e.message }));
     } else if (p === '/api/compose-auto' && req.method === 'POST') {
       handleComposeAuto(req, res).catch((e) => json(res, 500, { error: e.message }));
+    } else if (p === '/api/compose-timeline' && req.method === 'POST') {
+      handleComposeTimeline(req, res).catch((e) => json(res, 500, { error: e.message }));
     } else if (p === '/api/cards-overlay' && req.method === 'POST') {
       handleCardsOverlay(req, res).catch((e) => json(res, 500, { error: e.message }));
     } else if (p === '/api/compose' && req.method === 'POST') {
