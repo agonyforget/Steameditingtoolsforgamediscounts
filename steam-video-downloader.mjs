@@ -1261,6 +1261,8 @@ async function handleSubtitleGenerate(req, res) {
   const voiceName = String(payload.voiceFile || '').trim();
   const script = String(payload.script || '').trim();
   const dir = String(payload.voiceDir || '').trim() || DEFAULT_VOICE_DIR;
+  // srt 输出目录：可用 outDir 自定义，缺省与配音同目录。
+  const outDir = String(payload.outDir || '').trim() || dir;
   if (!voiceName || voiceName.includes('..') || voiceName.includes('/') || voiceName.includes('\\')) {
     return json(res, 400, { error: '请选择配音文件' });
   }
@@ -1271,6 +1273,11 @@ async function handleSubtitleGenerate(req, res) {
   if (!ff) return json(res, 500, { error: '未找到 ffmpeg' });
   const sentences = splitScriptSentences(script);
   if (!sentences.length) return json(res, 400, { error: '文案为空或无法分句' });
+  try {
+    fs.mkdirSync(outDir, { recursive: true });
+  } catch (e) {
+    return json(res, 400, { error: `无法创建字幕输出目录：${e.message}` });
+  }
 
   const tmpDir = path.join(dir, `.subtitle_tmp_${Date.now()}`);
   fs.mkdirSync(tmpDir, { recursive: true });
@@ -1282,9 +1289,9 @@ async function handleSubtitleGenerate(req, res) {
     const segments = await runWhisperAsr(wav);
     // 3) 文案句子 ↔ 时间轴对齐
     const cues = alignScriptToSegments(sentences, segments);
-    // 4) 生成并保存 srt（与配音同名）
+    // 4) 生成并保存 srt（与配音同名，存到 outDir）
     const srtText = buildSrt(cues);
-    const srtFile = path.join(dir, voiceName.replace(/\.[^.]+$/, '') + '.srt');
+    const srtFile = path.join(outDir, voiceName.replace(/\.[^.]+$/, '') + '.srt');
     fs.writeFileSync(srtFile, srtText, 'utf8');
     return json(res, 200, { ok: true, srtFile, srt: srtText, cues });
   } catch (e) {
@@ -1463,6 +1470,9 @@ https://store.steampowered.com/app/648800/Raft/"></textarea>
   </div>
   <div class="row">
     <select id="subVoiceSel" style="flex:1;min-width:200px"></select>
+  </div>
+  <div class="row">
+    <input type="text" id="subOutDir" placeholder="字幕保存目录（留空 = 与配音同目录）" style="flex:1" />
   </div>
   <label for="subScript" style="margin-top:10px">文案内容（每行一句或用标点分句均可）</label>
   <textarea id="subScript" placeholder="粘贴这里：例如&#10;幻兽帕鲁，一款开放世界的生存建造游戏……&#10;今天就介绍到这里，感兴趣的话快去试试吧。"></textarea>
@@ -1777,7 +1787,7 @@ subGenBtn.addEventListener('click', function(){
   fetch('/api/subtitle/generate', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ voiceFile: voiceFile, script: script, voiceDir: voiceDirVal() })
+    body: JSON.stringify({ voiceFile: voiceFile, script: script, voiceDir: voiceDirVal(), outDir: document.getElementById('subOutDir').value.trim() })
   })
     .then(function(r){ return r.json(); })
     .then(function(res){
