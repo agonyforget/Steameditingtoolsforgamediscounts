@@ -42,6 +42,7 @@ import path from 'node:path';
 import fs from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
+import zlib from 'node:zlib';
 
 // 脚本所在目录（内置 bin/ffmpeg.exe 从这里解析）。
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
@@ -1301,6 +1302,201 @@ async function handleSubtitleGenerate(req, res) {
   }
 }
 
+// ── Excel 读取（A3：零依赖 .xlsx 解析 + 上传预览）────────────────────────────
+
+// Excel 上传默认目录。
+const DEFAULT_EXCEL_DIR = process.env.EXCEL_DIR || 'E:/worddeepseek/videocut/excel';
+
+// 解压 zip（只读 local headers，标准 xlsx 足够）。返回 { entryName: Buffer }
+function unzipEntries(buf) {
+  const entries = {};
+  let i = 0;
+  while (i + 30 <= buf.length) {
+    if (buf.readUInt32LE(i) !== 0x04034b50) break; // 到 central directory 即停
+    const method = buf.readUInt16LE(i + 8);
+    const compSize = buf.readUInt32LE(i + 18);
+    const nameLen = buf.readUInt16LE(i + 26);
+    const extraLen = buf.readUInt16LE(i + 28);
+    const name = buf.subarray(i + 30, i + 30 + nameLen).toString('utf8');
+    const dataStart = i + 30 + nameLen + extraLen;
+    const data = buf.subarray(dataStart, dataStart + compSize);
+    if (!name.endsWith('/')) {
+      entries[name] = method === 0 ? Buffer.from(data) : zlib.inflateRawSync(data);
+    }
+    i = dataStart + compSize;
+  }
+  return entries;
+}
+
+// 解析 xlsx：返回 [{ name, path }]（sheet 名与对应 worksheet 文件路径）。
+function listXlsxSheets(buf) {
+  const zip = unzipEntries(buf);
+  const wb = (zip['xl/workbook.xml'] || Buffer.alloc(0)).toString('utf8');
+  const rels = (zip['xl/_rels/workbook.xml.rels'] || Buffer.alloc(0)).toString('utf8');
+  const relMap = {};
+  const relRe = /Id="(rId\d+)"[^>]*Target="([^"]*)"/g;
+  let m;
+  while ((m = relRe.exec(rels))) relMap[m[1]] = m[2];
+  const sheets = [];
+  const sheetRe = /<sheet[^>]*name="([^"]*)"[^>]*r:id="(rId\d+)"[^>]*\/?>/g;
+  while ((m = sheetRe.exec(wb))) {
+    const target = relMap[m[2]] || '';
+    if (target) sheets.push({ name: m[1], path: target.startsWith('/') ? target.slice(1) : `xl/${target.replace(/^\//, '')}`.replace(/^xl\/xl\//, 'xl/') });
+  }
+  // 简化路径归一
+  return sheets.map((s) => ({ ...s, path: s.path.replace(/^xl\/xl\//, 'xl/') }));
+}
+
+// 读取某个 sheet，返回二维数组（表头行 + 数据行），单元格保留原始文本。
+function readXlsxSheet(buf, sheetPath) {
+  const zip = unzipEntries(buf);
+  const ssXml = (zip['xl/sharedStrings.xml'] || Buffer.alloc(0)).toString('utf8');
+  const ss = [];
+  const siRe = /<si>(.*?)<\/si>/gs;
+  let mm;
+  while ((mm = siRe.exec(ssXml))) {
+    let txt = '';
+    const p = /<t[^>]*>(.*?)<\/t>/gs;
+    let tm;
+    while ((tm = p.exec(mm[1]))) txt += tm[1];
+    ss.push(txt);
+  }
+  const xml = (zip[sheetPath] || Buffer.alloc(0)).toString('utf8');
+  const rowRe = /<row[^>]*>(.*?)<\/row>/gs; // 捕获组(.*?) = 行内 XML
+  const grid = [];
+  const attrsOf = (s) => {
+    const o = {};
+    const re = /([\w:]+)="([^"]*)"/g;
+    let m;
+    while ((m = re.exec(s))) o[m[1]] = m[2];
+    return o;
+  };
+  while ((mm = rowRe.exec(xml))) {
+    const rowCells = [];
+    const cellRe = /<c\b[^>]*>.*?<\/c>|<c\b[^>]*\/>/gs;
+    let cm;
+    while ((cm = cellRe.exec(mm[1]))) {
+      const tag = cm[0];
+      const head = tag.slice(0, tag.indexOf('>'));
+      const a = attrsOf(head);
+      if (!a.r) continue;
+      const colMatch = /^([A-Z]+)/.exec(a.r);
+      if (!colMatch) continue;
+      const vM = /<v>([^<]*)<\/v>/.exec(tag);
+      const iM = /<is>[\s\S]*?<t[^>]*>(.*?)<\/t>[\s\S]*?<\/is>/.exec(tag);
+      let val = '';
+      if (a.t === 's' && vM) val = ss[Number(vM[1])] ?? '';
+      else if (a.t === 'inlineStr' && iM) val = iM[1];
+      else if (a.t === 'str' && vM) val = vM[1];
+      else if (vM) val = vM[1];
+      rowCells.push({ col: colMatch[1], val });
+    }
+    rowCells.sort((a, b) => a.col.length !== b.col.length ? a.col.length - b.col.length : (a.col < b.col ? -1 : 1));
+    const row = rowCells.map((c) => c.val.trim());
+    grid.push(row);
+  }
+  return grid;
+}
+
+// 把表头映射到标准字段（兼容中英文/别名），找不到用列位置补。
+const EXCEL_COL_MAP = [
+  { key: 'name', names: ['游戏名', '游戏名称', 'name', '名称'] },
+  { key: 'price', names: ['原价', 'price'] },
+  { key: 'now', names: ['现价', '折后价', '史低价', 'now'] },
+  { key: 'rating', names: ['好评率', 'rating', '评价'] },
+  { key: 'discount', names: ['折扣力度', '折扣档', 'discount'] },
+  { key: 'deadline', names: ['截止日期', '折扣截止', 'deadline', 'date'] },
+  { key: 'tag1', names: ['标签1', 'tag1', '标签'] },
+  { key: 'tag2', names: ['标签2', 'tag2'] },
+];
+
+// 将 grid 二维数组转成对象行（跳过表头），返回 { headers, cols, rows, total }。
+function mapExcelGrid(grid) {
+  const headers = grid[0] || [];
+  const colIdx = {}; // 字段名 -> 列下标
+  headers.forEach((h, i) => {
+    if (colIdx[h] !== undefined) return;
+    const clean = String(h).trim();
+    for (const def of EXCEL_COL_MAP) {
+      if (colIdx[def.key] !== undefined) continue;
+      if (def.names.some((n) => clean === n || clean.toLowerCase() === n.toLowerCase())) {
+        colIdx[def.key] = i;
+        break;
+      }
+    }
+  });
+  // 未命名的列按位置兜底（无表头或表头名不匹配时）
+  const rows = [];
+  for (let r = 1; r < grid.length; r++) {
+    const cells = grid[r];
+    if (!cells.length) continue;
+    if (cells.every((c) => !String(c).trim())) continue; // 空行
+    const obj = {};
+    for (const def of EXCEL_COL_MAP) {
+      const idx = colIdx[def.key] !== undefined ? colIdx[def.key] : EXCEL_COL_MAP.indexOf(def);
+      obj[def.key] = (cells[idx] !== undefined ? String(cells[idx]) : '').trim();
+    }
+    if (!obj.name && !obj.price && !obj.now) continue; // 无有效内容
+    rows.push(obj);
+  }
+  return { headers, colIdx, rows, total: rows.length };
+}
+
+// POST /api/excel/upload?name=xx.xlsx ：上传 xlsx（body 二进制），返回可用 sheet 列表。
+function handleExcelUpload(req, res, urlObj) {
+  const name = String(urlObj.searchParams.get('name') || '').trim();
+  const dir = urlObj.searchParams.get('dir') || DEFAULT_EXCEL_DIR;
+  if (!name || name.includes('..') || name.includes('/') || name.includes('\\')) return json(res, 400, { error: '文件名无效' });
+  if (!/\.xlsx?$/i.test(name)) return json(res, 400, { error: '仅支持 .xlsx 文件' });
+  try { fs.mkdirSync(dir, { recursive: true }); } catch (e) { return json(res, 400, { error: `无法创建目录：${e.message}` }); }
+  const target = path.join(dir, name);
+  const ws = fs.createWriteStream(target);
+  req.pipe(ws);
+  ws.on('finish', () => {
+    try {
+      const buf = fs.readFileSync(target);
+      const sheets = listXlsxSheets(buf);
+      if (!sheets.length) throw new Error('未识别到工作表');
+      const st = fs.statSync(target);
+      return json(res, 200, { ok: true, name, size: st.size, sheets });
+    } catch (e) {
+      try { fs.rmSync(target, { force: true }); } catch { /* ignore */ }
+      return json(res, 400, { error: `解析失败（文件可能损坏或不是 Excel）：${e.message}` });
+    }
+  });
+  ws.on('error', (e) => json(res, 500, { error: `写入失败：${e.message}` }));
+  req.on('aborted', () => { try { ws.destroy(); fs.rmSync(target, { force: true }); } catch { /* ignore */ } });
+}
+
+// GET /api/excel/preview?file=xx.xlsx&sheet=名称&dir=... ：解析指定 sheet 并返回表头 + 前 50 行 + 字段映射。
+function handleExcelPreview(urlObj, res) {
+  const dir = urlObj.searchParams.get('dir') || DEFAULT_EXCEL_DIR;
+  const file = String(urlObj.searchParams.get('file') || '').trim();
+  const sheetName = String(urlObj.searchParams.get('sheet') || '').trim();
+  if (!file || file.includes('..') || file.includes('/') || file.includes('\\')) return json(res, 400, { error: '文件名无效' });
+  const filePath = path.join(dir, file);
+  if (!fs.existsSync(filePath)) return json(res, 404, { error: `文件不存在：${file}` });
+  try {
+    const buf = fs.readFileSync(filePath);
+    const sheets = listXlsxSheets(buf);
+    const target = sheets.find((s) => s.name === sheetName) || sheets[0];
+    if (!target) return json(res, 400, { error: '没有可用的工作表' });
+    const grid = readXlsxSheet(buf, target.path);
+    if (!grid.length) return json(res, 200, { ok: true, sheet: target.name, headers: [], rows: [], total: 0 });
+    const mapped = mapExcelGrid(grid);
+    return json(res, 200, {
+      ok: true,
+      sheet: target.name,
+      headers: mapped.headers,
+      cols: mapped.colIdx,
+      rows: mapped.rows.slice(0, 50),
+      total: mapped.rows.length,
+    });
+  } catch (e) {
+    return json(res, 400, { error: `解析失败：${e.message}` });
+  }
+}
+
 // GET /api/materials?dir=... ：列出素材目录的 mp4（附带解析出的游戏名）。
 function handleMaterials(urlObj, res) {
   const dir = urlObj.searchParams.get('dir') || DEFAULT_DIR;
@@ -1484,6 +1680,24 @@ https://store.steampowered.com/app/648800/Raft/"></textarea>
     <span id="subStatus"></span>
   </div>
   <div id="subResult"></div>
+</div>
+
+<div class="card">
+  <h2>📊 Excel 游戏数据</h2>
+  <div class="sub" style="margin:0 0 8px">
+    上传 .xlsx 游戏信息表（表头形如：<code>游戏名 / 原价 / 现价 / 好评率 / 折扣力度 / 截止日期 / 标签1 / 标签2</code>），
+    选择工作表后解析预览。解析结果将用于后续"游戏卡片 / 片尾总表"。
+  </div>
+  <div class="row">
+    <input type="text" id="excelDir" placeholder="Excel 目录（默认 E:/worddeepseek/videocut/excel）" />
+    <button id="excelPick" class="ghost">📁 选择 xlsx 上传</button>
+    <input type="file" id="excelFile" accept=".xlsx" style="display:none" />
+    <select id="excelSheet" style="min-width:140px"></select>
+    <button id="excelLoad" class="ghost">🔍 解析所选工作表</button>
+    <span id="excelStatus"></span>
+  </div>
+  <div id="excelInfo"></div>
+  <div id="excelPreview"></div>
 </div>
 
 <div class="card">
@@ -1811,6 +2025,84 @@ subCopyBtn.addEventListener('click', function(){
     window.prompt('请手动复制（Ctrl+C）：', lastSrt);
   }
 });
+
+// ===== Excel 游戏数据（A3） =====
+var excelDirInput = document.getElementById('excelDir');
+var excelStatusEl = document.getElementById('excelStatus');
+var excelInfoEl = document.getElementById('excelInfo');
+var excelPreviewEl = document.getElementById('excelPreview');
+var excelSheetSel = document.getElementById('excelSheet');
+var excelFileInput = document.getElementById('excelFile');
+var lastExcelFile = '';
+window.__excelData = null; // { file, sheet, cols, rows, total } 供后续卡片使用
+
+function eStatus(t) { excelStatusEl.textContent = t || ''; }
+function excelDirVal() { return excelDirInput.value.trim() || ''; }
+
+document.getElementById('excelPick').addEventListener('click', function(){ excelFileInput.click(); });
+excelFileInput.addEventListener('change', function(){
+  var f = excelFileInput.files && excelFileInput.files[0];
+  if (!f) return;
+  if (!/\.xlsx$/i.test(f.name)) { eStatus('仅支持 .xlsx'); return; }
+  eStatus('上传中……');
+  var xhr = new XMLHttpRequest();
+  xhr.open('POST', '/api/excel/upload?name=' + encodeURIComponent(f.name) + '&dir=' + encodeURIComponent(excelDirVal()));
+  xhr.onload = function(){
+    var res;
+    try { res = JSON.parse(xhr.responseText); } catch (e) { res = { error: '响应异常' }; }
+    if (xhr.status === 200 && res.ok) {
+      lastExcelFile = f.name;
+      excelSheetSel.innerHTML = '';
+      (res.sheets || []).forEach(function(s, i){
+        var opt = document.createElement('option');
+        opt.value = s.name;
+        opt.textContent = s.name;
+        excelSheetSel.appendChild(opt);
+      });
+      eStatus('上传成功：' + f.name + '（' + (res.sheets || []).length + ' 个工作表）');
+      loadExcelPreview();
+    } else {
+      eStatus('上传失败');
+      excelInfoEl.innerHTML = '<div class="errmsg">' + esc(res.error || '未知错误') + '</div>';
+    }
+  };
+  xhr.onerror = function(){ eStatus('上传失败：网络错误'); };
+  xhr.send(f);
+  excelFileInput.value = '';
+});
+excelSheetSel.addEventListener('change', loadExcelPreview);
+document.getElementById('excelLoad').addEventListener('click', loadExcelPreview);
+
+function loadExcelPreview() {
+  if (!lastExcelFile) { eStatus('请先上传 xlsx'); return; }
+  var sheet = excelSheetSel.value || '';
+  eStatus('解析中……');
+  fetch('/api/excel/preview?file=' + encodeURIComponent(lastExcelFile) + '&sheet=' + encodeURIComponent(sheet) + '&dir=' + encodeURIComponent(excelDirVal()))
+    .then(function(r){ return r.json(); })
+    .then(function(res){
+      if (res.error) { eStatus('解析失败'); excelInfoEl.innerHTML = '<div class="errmsg">' + esc(res.error) + '</div>'; return; }
+      window.__excelData = { file: lastExcelFile, sheet: res.sheet, cols: res.cols, rows: res.rows, total: res.total };
+      var colNames = { name: '游戏名', price: '原价', now: '现价', rating: '好评率', discount: '折扣力度', deadline: '截止日期', tag1: '标签1', tag2: '标签2' };
+      var mapped = Object.keys(colNames).filter(function(k){ return res.cols[k] !== undefined; }).map(function(k){ return colNames[k] + '←列' + (res.cols[k] + 1); });
+      excelInfoEl.innerHTML = '<div class="meta" style="margin-top:6px">✅ 工作表「' + esc(res.sheet) + '」共解析 <b>' + res.total + '</b> 行' + (mapped.length ? '　字段映射：' + esc(mapped.join('，')) : '') + '</div>';
+      eStatus('解析完成 ✓');
+      // 预览表（前 50 行，按映射字段展示）
+      if (!res.rows.length) { excelPreviewEl.innerHTML = '<div class="empty">（无数据行）</div>'; return; }
+      var fOrder = ['name', 'price', 'now', 'rating', 'discount', 'deadline', 'tag1', 'tag2'];
+      var fLabels = { name: '游戏名', price: '原价', now: '现价', rating: '好评率', discount: '折扣力度', deadline: '截止日期', tag1: '标签1', tag2: '标签2' };
+      var html = '<table style="border-collapse:collapse;font-size:12px;margin-top:8px;width:100%"><tr><th style="border:1px solid #888;padding:4px 8px;background:rgba(127,127,127,.15)">#</th>';
+      fOrder.forEach(function(f){ html += '<th style="border:1px solid #888;padding:4px 8px;background:rgba(127,127,127,.15)">' + fLabels[f] + '</th>'; });
+      html += '</tr>';
+      res.rows.forEach(function(row, i){
+        html += '<tr><td style="border:1px solid #888;padding:3px 8px">' + (i + 1) + '</td>';
+        fOrder.forEach(function(f){ html += '<td style="border:1px solid #888;padding:3px 8px">' + esc(row[f] || '') + '</td>'; });
+        html += '</tr>';
+      });
+      html += '</table>';
+      excelPreviewEl.innerHTML = html;
+    })
+    .catch(function(e){ eStatus('解析失败'); excelInfoEl.innerHTML = '<div class="errmsg">请求失败：' + esc(e.message) + '</div>'; });
+}
 
 function deleteVoiceFile(i) {
   var f = voiceFiles[i];
@@ -2262,6 +2554,10 @@ function main() {
       handleVoiceDelete(urlObj, res);
     } else if (p === '/api/subtitle/generate' && req.method === 'POST') {
       handleSubtitleGenerate(req, res).catch((e) => json(res, 500, { error: e.message }));
+    } else if (p === '/api/excel/upload') {
+      handleExcelUpload(req, res, urlObj);
+    } else if (p === '/api/excel/preview') {
+      handleExcelPreview(urlObj, res);
     } else if (p === '/api/compose' && req.method === 'POST') {
       handleCompose(req, res).catch((e) => json(res, 500, { error: e.message }));
     } else if (p === '/api/open-folder') {
