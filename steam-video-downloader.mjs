@@ -1556,11 +1556,13 @@ async function voiceDurationOf(voicePath) {
   return runFfDuration(voicePath);
 }
 
-// POST /api/compose-auto ：素材↔配音按顺序配对自动成片。
+// POST /api/compose-auto ：素材↔配音按顺序配对自动成片（支持段间淡入淡出转场）。
 // body: {
 //   materials: [{ path, start? }]  素材顺序（start 默认 0）
 //   voices:    [{ path }]          配音顺序（与素材一一对应）
 //   padding: 2,                    每段画面比配音多出的余量秒数
+//   transition: 0.5,               段间淡入淡出秒数（0 = 硬切快速路径）
+//   fps: 30,                       转场重编码时的统一帧率
 //   outDir, outName?
 // }
 async function handleComposeAuto(req, res) {
@@ -1577,7 +1579,10 @@ async function handleComposeAuto(req, res) {
   if (materials.length !== voices.length) {
     return json(res, 400, { error: `素材(${materials.length})与配音(${voices.length})数量不一致，需一一对应` });
   }
+  const n = materials.length;
   const padding = Math.max(0, Number(payload.padding) || 2);
+  const transition = Math.max(0, Number(payload.transition) || 0);
+  const fps = Math.min(60, Math.max(12, Number(payload.fps) || 30));
   const outDir = String(payload.outDir || '').trim() || 'E:/worddeepseek/videocut/product';
   const ff = resolveFfmpeg();
   if (!ff) return json(res, 500, { error: '未找到 ffmpeg' });
@@ -1586,58 +1591,90 @@ async function handleComposeAuto(req, res) {
   const tmpDir = path.join(SCRIPT_DIR, `.tmp_auto_${Date.now()}_${randomUUID().slice(0, 8)}`);
   fs.mkdirSync(tmpDir, { recursive: true });
 
-  const normClips = [];
-  const voiceDelays = []; // 毫秒（段起点累计）
-  let acc = 0;
-
   try {
-    for (let i = 0; i < materials.length; i++) {
+    // ── 1) 计算各段画面时长 + 剪切（去原声） ──
+    const segLens = [];
+    const segTitles = [];
+    for (let i = 0; i < n; i++) {
       const mat = String(materials[i].path || '').trim();
       const voice = String(voices[i].path || '').trim();
       if (!fs.existsSync(mat)) throw new Error(`素材不存在：${mat}`);
       if (!fs.existsSync(voice)) throw new Error(`配音不存在：${voice}`);
       const start = Math.max(0, Number(materials[i].start) || 0);
-      // 配音时长 + 余量 = 画面段时长
       const tVoice = await voiceDurationOf(voice);
       const segLen = tVoice + padding;
-      // 校验素材够剪
+      if (transition > 0 && segLen <= transition + 0.2) {
+        throw new Error(`段 ${i + 1} 画面长度 ${segLen.toFixed(1)}s 过短，无法容纳 ${transition}s 转场（请减小转场或余量）`);
+      }
       const matDur = await runFfDuration(mat);
       if (start + segLen > matDur + 0.5) {
         throw new Error(`素材 ${i + 1}（${path.basename(mat)}）不够剪：需要从 ${start.toFixed(1)}s 剪 ${segLen.toFixed(1)}s，但素材总长仅 ${matDur.toFixed(1)}s`);
       }
-      // 剪画面段（去原声，流拷贝）
       const clip = path.join(tmpDir, `clip${i + 1}.mp4`);
       await runLocal(ff, ['-y', '-loglevel', 'error', '-ss', String(start), '-i', mat, '-t', String(segLen), '-an', '-c:v', 'copy', '-avoid_negative_ts', 'make_zero', clip], { timeoutMs: 120000 });
-      const norm = path.join(tmpDir, `norm${i + 1}.mp4`);
-      await runLocal(ff, ['-y', '-loglevel', 'error', '-i', clip, '-c', 'copy', '-video_track_timescale', '15360', norm], { timeoutMs: 120000 });
-      normClips.push(norm);
-      voiceDelays.push({ voice, delayMs: Math.round(acc * 1000) });
-      acc += segLen;
+      segLens.push(segLen);
+      segTitles.push(path.basename(mat));
     }
 
-    // 拼接画面（无音轨）
-    const video = path.join(tmpDir, 'video.mp4');
-    const listFile = path.join(tmpDir, 'list.txt');
-    fs.writeFileSync(listFile, normClips.map((c) => `file ${escapeConcatPath(c)}`).join('\n'), 'utf8');
-    await runLocal(ff, ['-y', '-loglevel', 'error', '-f', 'concat', '-safe', '0', '-i', listFile, '-c', 'copy', video], { timeoutMs: 600000 });
+    // 配音贴入点（秒）：段 i 在成片时间轴上的起点
+    //   硬切：acc_i = ΣL[0..i-1]
+    //   转场：offset_i = acc_i - i * transition（段 i≥1 作为 xfade 第二输入进入的时刻）
+    const accOf = (k) => segLens.slice(0, k).reduce((a, b) => a + b, 0);
+    const delaySec = (i) => (i === 0 ? 0 : accOf(i) - i * transition);
+    const totalDur = accOf(n) - (n > 1 ? (n - 1) * transition : 0);
 
-    // 合成音轨：静音底 + 各配音按延迟混入（amix normalize=0 保持音量）
+    // ── 2) 画面视频（无音轨） ──
+    const video = path.join(tmpDir, 'video.mp4');
+    if (transition > 0 && n > 1) {
+      // 淡入淡出转场：统一帧率后 xfade 链式合成（重编码）
+      const clips = segLens.map((_, i) => path.join(tmpDir, `clip${i + 1}.mp4`));
+      const args = ['-y', '-loglevel', 'error'];
+      clips.forEach((c) => args.push('-i', c));
+      const fc = [];
+      clips.forEach((_, i) => fc.push(`[${i}:v]fps=${fps},format=yuv420p[v${i}]`));
+      let prev = 'v0';
+      for (let k = 1; k < n; k++) {
+        const offset = accOf(k) - k * transition;
+        fc.push(`[${prev}][v${k}]xfade=transition=fade:duration=${transition.toFixed(3)}:offset=${offset.toFixed(3)}[x${k}]`);
+        prev = `x${k}`;
+      }
+      fc.push(`[${prev}]format=yuv420p[vout]`);
+      args.push('-filter_complex', fc.join(';'), '-map', '[vout]', '-c:v', 'libx264', '-crf', '18', '-preset', 'medium', '-pix_fmt', 'yuv420p', video);
+      await runLocal(ff, args, { timeoutMs: 900000 });
+    } else if (n === 1) {
+      // 单段：直接复用剪切段（转场无意义）
+      fs.copyFileSync(path.join(tmpDir, 'clip1.mp4'), video);
+    } else {
+      // 硬切：流拷贝 concat（timescale 归一后拼接）
+      const listFile = path.join(tmpDir, 'list.txt');
+      const normList = [];
+      for (let i = 0; i < n; i++) {
+        const norm = path.join(tmpDir, `norm${i + 1}.mp4`);
+        await runLocal(ff, ['-y', '-loglevel', 'error', '-i', path.join(tmpDir, `clip${i + 1}.mp4`), '-c', 'copy', '-video_track_timescale', '15360', norm], { timeoutMs: 120000 });
+        normList.push(norm);
+      }
+      fs.writeFileSync(listFile, normList.map((c) => `file ${escapeConcatPath(c)}`).join('\n'), 'utf8');
+      await runLocal(ff, ['-y', '-loglevel', 'error', '-f', 'concat', '-safe', '0', '-i', listFile, '-c', 'copy', video], { timeoutMs: 600000 });
+    }
+    if (!fs.existsSync(video)) throw new Error('画面合成失败（未生成视频）');
+
+    // ── 3) 混音：静音底 + 配音按延迟贴入 ──
     const baseName = (payload.outName && String(payload.outName).trim())
       ? String(payload.outName).trim()
       : `${todayStr()}_自动贴合`;
     const dest = uniquePath(path.join(outDir, `${sanitizeName(baseName)}.mp4`));
 
-    const args = ['-y', '-loglevel', 'error', '-i', video, '-f', 'lavfi', '-i', 'anullsrc=r=44100:cl=stereo'];
-    voiceDelays.forEach((v) => args.push('-i', v.voice));
+    const args = ['-y', '-loglevel', 'error', '-i', video, '-f', 'lavfi', '-i', `anullsrc=r=44100:cl=stereo`];
+    voices.forEach((v) => args.push('-i', v.path));
     const fc = [];
-    // 底轨
-    fc.push('[1:a]atrim=0:' + acc.toFixed(3) + ',asetpts=PTS-STARTPTS[base]');
-    voiceDelays.forEach((v, k) => {
+    fc.push(`[1:a]atrim=0:${totalDur.toFixed(3)},asetpts=PTS-STARTPTS[base]`);
+    voices.forEach((_, k) => {
       const idx = 2 + k;
-      fc.push(`[${idx}:a]aformat=sample_rates=44100:channel_layouts=stereo,adelay=${v.delayMs}|${v.delayMs}[vo${k}]`);
+      const d = Math.max(0, Math.round(delaySec(k) * 1000));
+      fc.push(`[${idx}:a]aformat=sample_rates=44100:channel_layouts=stereo,adelay=${d}|${d}[vo${k}]`);
     });
-    const ins = ['[base]'].concat(voiceDelays.map((_, k) => `[vo${k}]`)).join('');
-    fc.push(`${ins}amix=inputs=${1 + voiceDelays.length}:duration=longest:normalize=0[aout]`);
+    const ins = ['[base]'].concat(voices.map((_, k) => `[vo${k}]`)).join('');
+    fc.push(`${ins}amix=inputs=${1 + n}:duration=longest:normalize=0[aout]`);
     args.push('-filter_complex', fc.join(';'), '-map', '0:v', '-map', '[aout]', '-c:v', 'copy', '-c:a', 'aac', '-b:a', '192k', dest);
     await runLocal(ff, args, { timeoutMs: 600000 });
     if (!fs.existsSync(dest)) throw new Error('合成失败（未生成文件）');
@@ -1646,8 +1683,14 @@ async function handleComposeAuto(req, res) {
       ok: true,
       output: dest,
       size: st.size,
-      duration: acc,
-      segments: voiceDelays.map((v, i) => ({ index: i + 1, delayMs: v.delayMs, segSeconds: acc ? null : null, voice: path.basename(v.voice) })),
+      duration: Math.round(totalDur * 100) / 100,
+      transition,
+      segments: voices.map((v, i) => ({
+        index: i + 1,
+        delayMs: Math.max(0, Math.round(delaySec(i) * 1000)),
+        voice: path.basename(v.path),
+        material: segTitles[i],
+      })),
     });
   } catch (e) {
     return json(res, 502, { error: `自动成片失败：${e.message}` });
@@ -1863,7 +1906,7 @@ https://store.steampowered.com/app/648800/Raft/"></textarea>
   <h2>⏱️ 自动贴合成片（按配音时长）</h2>
   <div class="sub" style="margin:0 0 8px">
     素材与配音<strong>按顺序一一对应</strong>（素材1↔配音1↔Excel行1）。每段画面时长 = 配音时长（优先同名 .srt，否则实测音频）+ <strong>余量</strong>秒；
-    画面自动剪切并去掉素材原声，配音按段落起点贴入音轨，最后拼接成片（本版硬切，转场下一版）。
+    画面自动剪切并去掉素材原声，段间按<strong>转场</strong>秒数淡入淡出（0=硬切），配音按段落起点贴入音轨，输出成片。
   </div>
   <div class="row">
     <input type="text" id="autoMatDir" placeholder="素材目录（默认下载素材目录）" />
@@ -1875,6 +1918,7 @@ https://store.steampowered.com/app/648800/Raft/"></textarea>
   <div id="autoRows"></div>
   <div class="row">
     <label class="chk">画面余量（秒）<input type="number" id="autoPadding" value="2" min="0" max="30" style="width:60px" /></label>
+    <label class="chk">段间转场（秒，0=硬切）<input type="number" id="autoTransition" value="0.5" min="0" max="5" step="0.1" style="width:60px" /></label>
     <input type="text" id="autoOutDir" placeholder="成品目录（默认 E:/worddeepseek/videocut/product）" style="flex:1" />
     <input type="text" id="autoOutName" placeholder="成品名（留空自动）" style="flex:1" />
   </div>
@@ -2472,6 +2516,7 @@ autoGenBtn.addEventListener('click', function(){
     materials: autoMats.map(function(m){ return { path: m.path, start: m.start || 0 }; }),
     voices: autoVoices.map(function(v){ return { path: v.path }; }),
     padding: Number(autoPaddingInput.value) || 2,
+    transition: Number(document.getElementById('autoTransition').value) || 0,
     outDir: autoOutDirInput.value.trim(),
     outName: autoOutNameInput.value.trim()
   };
