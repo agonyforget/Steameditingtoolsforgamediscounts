@@ -1991,8 +1991,14 @@ async function handleSteamCards(req, res) {
       const [rating, extras] = await Promise.all([fetchSteamRating(job.appid), fetchStoreExtras(job.appid)]);
       const gens = (data.genres || []).map((g) => g.description).filter(Boolean);
       const cats = (data.categories || []).map((c) => c.description).filter(Boolean);
-      // 标签：优先商店页热门用户标签（前 2），否则官方类型
-      const tagSrc = extras.tags.length >= 1 ? extras.tags : gens.concat(cats);
+      // 标签：优先中文热门标签（前2）；中文不足时用官方类型(中文)补足；仍不足才退回原始标签
+      const zh = extras.tags.filter((t) => /[\u4e00-\u9fff]/.test(String(t)));
+      const zhg = gens.filter((g) => !zh.includes(g));
+      const tagSrc = zh.length >= 2
+        ? zh
+        : zh.concat(zhg).concat(extras.tags).filter((v, i, a) => v && a.indexOf(v) === i);
+      const tag1 = tagSrc[0] || '';
+      const tag2 = tagSrc[1] || '';
       const price = po ? String((po.initial || 0) / 100) : '';
       const now = po ? String((po.final || 0) / 100) : '';
       const discount = po && po.discount_percent ? `-${po.discount_percent}%` : '';
@@ -2004,8 +2010,8 @@ async function handleSteamCards(req, res) {
         rating: rating || '',
         discount: discount || '',
         deadline: extras.deadline || '',
-        tag1: tagSrc[0] || '',
-        tag2: tagSrc[1] || '',
+        tag1,
+        tag2,
         raw: null,
         source: 'steam',
       });
