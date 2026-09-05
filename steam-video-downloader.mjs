@@ -1782,7 +1782,8 @@ function buildCardLines(c) {
   const rating = fmtRating(c.rating);
   if (rating) lines.push({ text: `好评率：${rating}`, fs: 1, color: '#333333' });
   const extra = probeExtra(c.raw);
-  if (extra.keyPrice) lines.push({ text: `Key价格 ${extra.keyPrice}`, fs: 1, color: '#333333' });
+  const kp = c.keyPrice || extra.keyPrice;
+  if (kp) lines.push({ text: `Key价格 ${kp}`, fs: 1, color: '#333333' });
   if (extra.hasCn) lines.push({ text: extra.hasCn, fs: 1, color: '#333333' });
   return lines;
 }
@@ -1903,10 +1904,11 @@ async function handleCardsOverlay(req, res) {
 
 // ── Steam 链接直抓游戏卡片数据（无需 Excel）─────────────────────────────────
 
-// 商店页抓取"折扣截止日期 + 热门用户标签"（同一页面一次下载）。
-// 截止来源：中文页文本 "每日特惠！9 月 18 日截止"；标签来源：页面内 "tags":["策略","回合战略",...]。
+// 商店页抓取"折扣截止日期 + 热门用户标签 + 购买 subid"（同一页面一次下载）。
+// 截止来源：中文页文本 "每日特惠！9 月 18 日截止"；标签来源：页面内 "tags":[...]；
+// subid：购买表单 name="subid"（用于 SteamPY Key 价查询）。
 async function fetchStoreExtras(appid) {
-  const empty = { deadline: '', tags: [] };
+  const empty = { deadline: '', tags: [], subId: '' };
   try {
     const r = await fetchText(`https://store.steampowered.com/app/${appid}/?l=schinese&cc=cn`, { timeoutMs: 30000 });
     let deadline = '';
@@ -1932,10 +1934,23 @@ async function fetchStoreExtras(appid) {
         tags = arr.filter((x) => typeof x === 'string' && x.trim());
       } catch { /* ignore */ }
     }
-    return { deadline, tags };
+    const subM = /name="subid" value="(\d+)"/.exec(r.text);
+    return { deadline, tags, subId: subM ? subM[1] : '' };
   } catch {
     return empty;
   }
+}
+
+// SteamPY Key 价查询（与 PYTools 扩展同一接口）：返回 keyPrice 数字或空。
+async function fetchSteamPyKeyPrice(subId, appid) {
+  if (!subId) return '';
+  try {
+    const r = await fetchText(`https://steampy.com/xboot/common/plugIn/getGame?subId=${subId}&appId=${appid}&type=subid`, { timeoutMs: 15000 });
+    const j = JSON.parse(r.text);
+    const kp = j && j.result && j.result.keyPrice;
+    return typeof kp === 'number' && kp > 0 ? kp : '';
+  } catch { /* ignore */ }
+  return '';
 }
 
 // 好评率（0-1 小数）：appreviews 接口 all 语言统计。
@@ -1988,7 +2003,11 @@ async function handleSteamCards(req, res) {
         return;
       }
       const po = data.price_overview;
-      const [rating, extras] = await Promise.all([fetchSteamRating(job.appid), fetchStoreExtras(job.appid)]);
+      const extras = await fetchStoreExtras(job.appid);
+      const [rating, keyPrice] = await Promise.all([
+        fetchSteamRating(job.appid),
+        extras.subId ? fetchSteamPyKeyPrice(extras.subId, job.appid) : Promise.resolve(''),
+      ]);
       const gens = (data.genres || []).map((g) => g.description).filter(Boolean);
       const cats = (data.categories || []).map((c) => c.description).filter(Boolean);
       // 标签：优先中文热门标签（前2）；中文不足时用官方类型(中文)补足；仍不足才退回原始标签
@@ -2010,6 +2029,7 @@ async function handleSteamCards(req, res) {
         rating: rating || '',
         discount: discount || '',
         deadline: extras.deadline || '',
+        keyPrice: keyPrice || '',
         tag1,
         tag2,
         raw: null,
@@ -3276,7 +3296,7 @@ function renderSteamRows(rows) {
     bad.forEach(function(r){ html += '<div class="errmsg">appid ' + esc(r.appid) + '：' + esc(r.error) + '</div>'; });
   }
   if (good.length) {
-    html += '<table style="border-collapse:collapse;font-size:12px;margin-top:8px;width:100%"><tr><th style="border:1px solid #888;padding:4px 8px;background:rgba(127,127,127,.15)">#</th><th style="border:1px solid #888;padding:4px 8px;background:rgba(127,127,127,.15)">游戏名</th><th style="border:1px solid #888;padding:4px 8px;background:rgba(127,127,127,.15)">原/现</th><th style="border:1px solid #888;padding:4px 8px;background:rgba(127,127,127,.15)">折扣</th><th style="border:1px solid #888;padding:4px 8px;background:rgba(127,127,127,.15)">好评率</th><th style="border:1px solid #888;padding:4px 8px;background:rgba(127,127,127,.15)">截止</th><th style="border:1px solid #888;padding:4px 8px;background:rgba(127,127,127,.15)">标签</th></tr>';
+    html += '<table style="border-collapse:collapse;font-size:12px;margin-top:8px;width:100%"><tr><th style="border:1px solid #888;padding:4px 8px;background:rgba(127,127,127,.15)">#</th><th style="border:1px solid #888;padding:4px 8px;background:rgba(127,127,127,.15)">游戏名</th><th style="border:1px solid #888;padding:4px 8px;background:rgba(127,127,127,.15)">原/现</th><th style="border:1px solid #888;padding:4px 8px;background:rgba(127,127,127,.15)">折扣</th><th style="border:1px solid #888;padding:4px 8px;background:rgba(127,127,127,.15)">好评率</th><th style="border:1px solid #888;padding:4px 8px;background:rgba(127,127,127,.15)">截止</th><th style="border:1px solid #888;padding:4px 8px;background:rgba(127,127,127,.15)">Key价</th><th style="border:1px solid #888;padding:4px 8px;background:rgba(127,127,127,.15)">标签</th></tr>';
     good.forEach(function(r, i) {
       var rating = r.rating ? (Number(r.rating) <= 1 ? (Number(r.rating) * 100).toFixed(0) + '%' : r.rating) : '-';
       html += '<tr><td style="border:1px solid #888;padding:3px 8px">' + (i + 1) + '</td>';
@@ -3285,6 +3305,7 @@ function renderSteamRows(rows) {
       html += '<td style="border:1px solid #888;padding:3px 8px">' + esc(r.discount || '-') + '</td>';
       html += '<td style="border:1px solid #888;padding:3px 8px">' + esc(rating) + '</td>';
       html += '<td style="border:1px solid #888;padding:3px 8px">' + esc(r.deadline || '-') + '</td>';
+      html += '<td style="border:1px solid #888;padding:3px 8px">' + esc(r.keyPrice || '-') + '</td>';
       html += '<td style="border:1px solid #888;padding:3px 8px">' + esc([r.tag1, r.tag2].filter(Boolean).join(' ')) + '</td></tr>';
     });
     html += '</table>';
@@ -3383,7 +3404,7 @@ autoGenBtn.addEventListener('click', function(){
   if (!okCnt) { aStatus('配音数需等于素材数，或比素材多 1（01=片头开场白）'); return; }
   // 自动携带游戏数据（Excel / Steam 抓取结果）用于片尾总表
   var gd = window.__excelData;
-  var games = (gd && gd.rows && gd.rows.length) ? gd.rows.map(function(r){ return { name: r.name, price: r.price, now: r.now, rating: r.rating, discount: r.discount, deadline: r.deadline, tag1: r.tag1, tag2: r.tag2 }; }) : [];
+  var games = (gd && gd.rows && gd.rows.length) ? gd.rows.map(function(r){ return { name: r.name, price: r.price, now: r.now, rating: r.rating, discount: r.discount, deadline: r.deadline, keyPrice: r.keyPrice || '', tag1: r.tag1, tag2: r.tag2 }; }) : [];
   var payload = {
     materials: autoMats.map(function(m){ return { path: m.path, start: m.start || 0 }; }),
     voices: autoVoices.map(function(v){ return { path: v.path }; }),
@@ -3433,7 +3454,7 @@ function cStatus2(t) { cardStatusEl.textContent = t || ''; }
 document.getElementById('cardLoadExcel').addEventListener('click', function(){
   var d = window.__excelData;
   if (!d || !d.rows || !d.rows.length) { cStatus2('请先在「📊 Excel 游戏数据」解析工作表'); return; }
-  cardList = d.rows.map(function(r){ return { name: r.name, price: r.price, now: r.now, rating: r.rating, discount: r.discount, deadline: r.deadline, tag1: r.tag1, tag2: r.tag2, raw: r.raw || null, start: '', end: '' }; });
+  cardList = d.rows.map(function(r){ return { name: r.name, price: r.price, now: r.now, rating: r.rating, discount: r.discount, deadline: r.deadline, keyPrice: r.keyPrice || '', tag1: r.tag1, tag2: r.tag2, raw: r.raw || null, start: '', end: '' }; });
   renderCardRows();
   cStatus2('已载入 ' + cardList.length + ' 张卡片（来自 Excel）');
 });
@@ -3506,7 +3527,7 @@ cardGenBtn.addEventListener('click', function(){
   var cards = cardList.filter(function(c){
     return c.start !== '' && c.end !== '' && (c.name || c.price);
   }).map(function(c){
-    return { start: Number(c.start) || 0, end: Number(c.end) || 0, name: c.name, price: c.price, now: c.now, rating: c.rating, discount: c.discount, deadline: c.deadline, tag1: c.tag1, tag2: c.tag2, raw: c.raw };
+    return { start: Number(c.start) || 0, end: Number(c.end) || 0, name: c.name, price: c.price, now: c.now, rating: c.rating, discount: c.discount, deadline: c.deadline, keyPrice: c.keyPrice || '', tag1: c.tag1, tag2: c.tag2, raw: c.raw };
   });
   if (!cards.length) { cStatus2('没有可用的卡片（请填开始/结束时间）'); return; }
   cardGenBtn.disabled = true;
