@@ -1874,6 +1874,121 @@ async function handleCardsOverlay(req, res) {
   }
 }
 
+// ── Steam 链接直抓游戏卡片数据（无需 Excel）─────────────────────────────────
+
+// 商店页抓取"折扣截止日期 + 热门用户标签"（同一页面一次下载）。
+// 截止来源：中文页文本 "每日特惠！9 月 18 日截止"；标签来源：页面内 "tags":["策略","回合战略",...]。
+async function fetchStoreExtras(appid) {
+  const empty = { deadline: '', tags: [] };
+  try {
+    const r = await fetchText(`https://store.steampowered.com/app/${appid}/?l=schinese&cc=cn`, { timeoutMs: 30000 });
+    let deadline = '';
+    const cm = /game_purchase_discount_countdown">([^<]{0,100})</.exec(r.text);
+    if (cm) {
+      const t = cm[1];
+      const zh = /(\d{1,2})\s*月\s*(\d{1,2})\s*日/.exec(t);
+      if (zh) deadline = `${Number(zh[1])}.${Number(zh[2])}`;
+      else {
+        const en = /(\d{1,2})\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)/.exec(t);
+        if (en) deadline = `${en[2]}.${Number(en[1])}`;
+        else {
+          const en2 = /(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{1,2})/.exec(t);
+          if (en2) deadline = `${en2[1]}.${Number(en2[2])}`;
+        }
+      }
+    }
+    let tags = [];
+    const tm = /"tags":\[([^\]]*)\]/.exec(r.text);
+    if (tm) {
+      try {
+        const arr = JSON.parse(`[${tm[1]}]`);
+        tags = arr.filter((x) => typeof x === 'string' && x.trim());
+      } catch { /* ignore */ }
+    }
+    return { deadline, tags };
+  } catch {
+    return empty;
+  }
+}
+
+// 好评率（0-1 小数）：appreviews 接口 all 语言统计。
+async function fetchSteamRating(appid) {
+  try {
+    const r = await fetchText(`https://store.steampowered.com/appreviews/${appid}?json=1&language=all&filter=all&purchase_type=all`, { timeoutMs: 30000 });
+    const j = JSON.parse(r.text);
+    const q = j && j.query_summary;
+    if (q && q.total_reviews > 0) {
+      return Math.round((q.total_positive / q.total_reviews) * 10000) / 10000; // 0.94
+    }
+  } catch { /* ignore */ }
+  return '';
+}
+
+// POST /api/steam/cards ：{ links: [Steam链接或appid...] } → 逐游戏抓取卡片字段（顺序=链接顺序）。
+async function handleSteamCards(req, res) {
+  let payload;
+  try {
+    payload = JSON.parse(await readBody(req));
+  } catch {
+    return json(res, 400, { error: '请求体不是合法 JSON' });
+  }
+  const links = (Array.isArray(payload.links) ? payload.links : []).map(String).filter((s) => s.trim());
+  if (!links.length) return json(res, 400, { error: '请粘贴至少一个 Steam 链接' });
+  const jobs = [];
+  const seen = new Set();
+  for (const raw of links) {
+    const appid = extractAppId(raw);
+    if (!appid) {
+      jobs.push({ appid: null, error: '无法识别 appid', raw });
+      continue;
+    }
+    if (seen.has(appid)) continue;
+    seen.add(appid);
+    jobs.push({ appid });
+  }
+
+  const rows = [];
+  let errs = [];
+  await runPool(jobs, async (job) => {
+    if (!job.appid) {
+      errs.push(job.raw);
+      return;
+    }
+    try {
+      const data = await fetchApp(job.appid);
+      if (!data) {
+        rows.push({ appid: job.appid, name: `App ${job.appid}`, error: '未返回数据（不存在/地区受限/需年龄验证）' });
+        return;
+      }
+      const po = data.price_overview;
+      const [rating, extras] = await Promise.all([fetchSteamRating(job.appid), fetchStoreExtras(job.appid)]);
+      const gens = (data.genres || []).map((g) => g.description).filter(Boolean);
+      const cats = (data.categories || []).map((c) => c.description).filter(Boolean);
+      // 标签：优先商店页热门用户标签（前 2），否则官方类型
+      const tagSrc = extras.tags.length >= 1 ? extras.tags : gens.concat(cats);
+      const price = po ? String((po.initial || 0) / 100) : '';
+      const now = po ? String((po.final || 0) / 100) : '';
+      const discount = po && po.discount_percent ? `-${po.discount_percent}%` : '';
+      rows.push({
+        appid: job.appid,
+        name: data.name || '',
+        price: price === now ? '' : price,
+        now: now || '',
+        rating: rating || '',
+        discount: discount || '',
+        deadline: extras.deadline || '',
+        tag1: tagSrc[0] || '',
+        tag2: tagSrc[1] || '',
+        raw: null,
+        source: 'steam',
+      });
+    } catch (e) {
+      rows.push({ appid: job.appid, error: `抓取失败：${e.message}` });
+    }
+  }, 3);
+  return json(res, 200, { ok: true, rows, errs });
+}
+
 // GET /api/materials?dir=... ：列出素材目录的 mp4（附带解析出的游戏名）。
 function handleMaterials(urlObj, res) {
   const dir = urlObj.searchParams.get('dir') || DEFAULT_DIR;
@@ -2060,18 +2175,32 @@ https://store.steampowered.com/app/648800/Raft/"></textarea>
 </div>
 
 <div class="card">
-  <h2>📊 Excel 游戏数据</h2>
+  <h2>📊 游戏数据（Excel / Steam 直抓）</h2>
   <div class="sub" style="margin:0 0 8px">
-    上传 .xlsx 游戏信息表（表头形如：<code>游戏名 / 原价 / 现价 / 好评率 / 折扣力度 / 截止日期 / 标签1 / 标签2</code>），
-    选择工作表后解析预览。解析结果将用于后续"游戏卡片 / 片尾总表"。
+    数据来源二选一：<b>Excel 表格</b> 或 <b>Steam 链接直抓</b>（从商店接口自动取价格/折扣/好评率/标签/截止日期，无需表格）。
+    解析结果供"游戏卡片 / 片尾总表"使用。
   </div>
   <div class="row">
-    <input type="text" id="excelDir" placeholder="Excel 目录（默认 E:/worddeepseek/videocut/excel）" />
-    <button id="excelPick" class="ghost">📁 选择 xlsx 上传</button>
-    <input type="file" id="excelFile" accept=".xlsx" style="display:none" />
-    <select id="excelSheet" style="min-width:140px"></select>
-    <button id="excelLoad" class="ghost">🔍 解析所选工作表</button>
-    <span id="excelStatus"></span>
+    <button id="srcExcelBtn" class="ghost">📊 Excel 上传</button>
+    <button id="srcSteamBtn" class="ghost">🔗 Steam 链接直抓</button>
+  </div>
+  <div id="srcExcelBox">
+    <div class="row">
+      <input type="text" id="excelDir" placeholder="Excel 目录（默认 E:/worddeepseek/videocut/excel）" />
+      <button id="excelPick" class="ghost">📁 选择 xlsx 上传</button>
+      <input type="file" id="excelFile" accept=".xlsx" style="display:none" />
+      <select id="excelSheet" style="min-width:140px"></select>
+      <button id="excelLoad" class="ghost">🔍 解析所选工作表</button>
+      <span id="excelStatus"></span>
+    </div>
+  </div>
+  <div id="srcSteamBox" style="display:none">
+    <label for="steamLinks" style="margin-top:8px">Steam 链接（每行一个，顺序 = 段落/素材顺序）</label>
+    <textarea id="steamLinks" placeholder="https://store.steampowered.com/app/590380/Into_the_Breach/&#10;https://store.steampowered.com/app/1623730/Palworld/"></textarea>
+    <div class="row">
+      <button id="steamFetch" class="ghost">🔍 抓取游戏数据</button>
+      <span id="steamStatus"></span>
+    </div>
   </div>
   <div id="excelInfo"></div>
   <div id="excelPreview"></div>
@@ -2624,6 +2753,75 @@ voiceDirInput.parentElement.parentElement.addEventListener('drop', function(e){
 });
 voiceDirInput.addEventListener('change', loadVoiceFiles);
 loadVoiceFiles();
+
+// ===== 数据来源切换（Excel / Steam 直抓） =====
+var srcExcelBox = document.getElementById('srcExcelBox');
+var srcSteamBox = document.getElementById('srcSteamBox');
+var steamLinksEl = document.getElementById('steamLinks');
+var steamStatusEl = document.getElementById('steamStatus');
+
+function setDataSource(mode) {
+  if (mode === 'steam') {
+    srcExcelBox.style.display = 'none';
+    srcSteamBox.style.display = 'block';
+  } else {
+    srcExcelBox.style.display = 'block';
+    srcSteamBox.style.display = 'none';
+  }
+}
+document.getElementById('srcExcelBtn').addEventListener('click', function(){ setDataSource('excel'); });
+document.getElementById('srcSteamBtn').addEventListener('click', function(){ setDataSource('steam'); });
+
+document.getElementById('steamFetch').addEventListener('click', function(){
+  var text = steamLinksEl.value.trim();
+  if (!text) { steamStatusEl.textContent = '请粘贴 Steam 链接'; return; }
+  var links = text.split(/\r?\n/).map(function(s){ return s.trim(); }).filter(Boolean);
+  var btn = document.getElementById('steamFetch');
+  btn.disabled = true;
+  steamStatusEl.textContent = '抓取中（每个游戏约需 2~6 秒）……';
+  excelInfoEl.innerHTML = '';
+  excelPreviewEl.innerHTML = '';
+  fetch('/api/steam/cards', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ links: links })
+  })
+    .then(function(r){ return r.json(); })
+    .then(function(res){
+      btn.disabled = false;
+      if (res.error) { steamStatusEl.textContent = '抓取失败：' + res.error; return; }
+      var okRows = (res.rows || []).filter(function(rw){ return !rw.error; });
+      window.__excelData = { file: 'steam', sheet: 'steam', cols: {}, rows: okRows, total: okRows.length };
+      steamStatusEl.textContent = '抓取完成：成功 ' + okRows.length + ' 个' + (res.errs && res.errs.length ? '，失败 ' + res.errs.length + ' 个' : '');
+      renderSteamRows(okRows);
+    })
+    .catch(function(e){ btn.disabled = false; steamStatusEl.textContent = '抓取失败：' + e.message; });
+});
+
+function renderSteamRows(rows) {
+  var bad = (rows || []).filter(function(r){ return r.error; });
+  var good = (rows || []).filter(function(r){ return !r.error; });
+  var html = '<div class="meta" style="margin-top:6px">共抓取 ' + good.length + ' 条' + (bad.length ? '，其中 ' + bad.length + ' 条失败' : '') + '</div>';
+  if (bad.length) {
+    bad.forEach(function(r){ html += '<div class="errmsg">appid ' + esc(r.appid) + '：' + esc(r.error) + '</div>'; });
+  }
+  if (good.length) {
+    html += '<table style="border-collapse:collapse;font-size:12px;margin-top:8px;width:100%"><tr><th style="border:1px solid #888;padding:4px 8px;background:rgba(127,127,127,.15)">#</th><th style="border:1px solid #888;padding:4px 8px;background:rgba(127,127,127,.15)">游戏名</th><th style="border:1px solid #888;padding:4px 8px;background:rgba(127,127,127,.15)">原/现</th><th style="border:1px solid #888;padding:4px 8px;background:rgba(127,127,127,.15)">折扣</th><th style="border:1px solid #888;padding:4px 8px;background:rgba(127,127,127,.15)">好评率</th><th style="border:1px solid #888;padding:4px 8px;background:rgba(127,127,127,.15)">截止</th><th style="border:1px solid #888;padding:4px 8px;background:rgba(127,127,127,.15)">标签</th></tr>';
+    good.forEach(function(r, i) {
+      var rating = r.rating ? (Number(r.rating) <= 1 ? (Number(r.rating) * 100).toFixed(0) + '%' : r.rating) : '-';
+      html += '<tr><td style="border:1px solid #888;padding:3px 8px">' + (i + 1) + '</td>';
+      html += '<td style="border:1px solid #888;padding:3px 8px">' + esc(r.name) + '</td>';
+      html += '<td style="border:1px solid #888;padding:3px 8px">' + esc([r.price, r.now].filter(Boolean).join(' → ')) + '</td>';
+      html += '<td style="border:1px solid #888;padding:3px 8px">' + esc(r.discount || '-') + '</td>';
+      html += '<td style="border:1px solid #888;padding:3px 8px">' + esc(rating) + '</td>';
+      html += '<td style="border:1px solid #888;padding:3px 8px">' + esc(r.deadline || '-') + '</td>';
+      html += '<td style="border:1px solid #888;padding:3px 8px">' + esc([r.tag1, r.tag2].filter(Boolean).join(' ')) + '</td></tr>';
+    });
+    html += '</table>';
+  }
+  excelPreviewEl.innerHTML = html;
+  excelInfoEl.innerHTML = '<div class="meta" style="margin-top:6px">✅ 已抓取 ' + good.length + ' 条游戏数据（顺序=链接顺序）。可到「🃏 游戏卡片叠加」载入使用</div>';
+}
 
 // ===== 自动贴合成片（A4） =====
 var autoMatDirInput = document.getElementById('autoMatDir');
@@ -3203,6 +3401,8 @@ function main() {
       handleExcelUpload(req, res, urlObj);
     } else if (p === '/api/excel/preview') {
       handleExcelPreview(urlObj, res);
+    } else if (p === '/api/steam/cards' && req.method === 'POST') {
+      handleSteamCards(req, res).catch((e) => json(res, 500, { error: e.message }));
     } else if (p === '/api/compose-auto' && req.method === 'POST') {
       handleComposeAuto(req, res).catch((e) => json(res, 500, { error: e.message }));
     } else if (p === '/api/cards-overlay' && req.method === 'POST') {
