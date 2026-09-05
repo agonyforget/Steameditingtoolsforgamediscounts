@@ -2324,12 +2324,60 @@ async function handleComposeTimeline(req, res) {
     if (tailDur > 0) { addWin('片尾', pos, tailDur); pos++; }
     if (tableDur > 0) { addWin('省流总表', pos, tableDur); }
 
+    // ── 导出"剪映微调素材包"：各段画面 + 配套配音 + 对齐字幕 + 组装说明 ──
+    let kitDir = '';
+    try {
+      if (payload.exportKit !== false) {
+        const baseTag = sanitizeName(baseName);
+        kitDir = path.join(outDir, `${baseTag}_剪映素材包`);
+        fs.mkdirSync(kitDir, { recursive: true });
+        const guide = ['剪映微调素材包 —— 把视频按顺序拖到视频轨，配音拖到音频轨，字幕(.srt)导入字幕轨即可',
+          '（画面 / 配音 / 字幕已按段对齐；字幕时间从每段 0 开始，与对应画面一致）', '', '顺序 | 类型 | 文件 | 时长(秒) | 说明', '----'];
+        fileList.forEach((f, fi) => {
+          const w = windows[fi];
+          if (!w) return;
+          const prefix = String(fi + 1).padStart(2, '0');
+          const vname = `${prefix}_${w.label}.mp4`;
+          fs.copyFileSync(f, path.join(kitDir, vname));
+          const durSec = Math.round((w.endMs - w.startMs) / 1000);
+          let line = `${prefix} | ${w.label}画面 | ${vname} | ${durSec} | `;
+          // 配套配音与字幕
+          let pairedVoice = '';
+          if (w.label === '片头' && hasHead) pairedVoice = headVoicePath;
+          else {
+            const gm = /^游戏(\d+)$/.exec(w.label);
+            if (gm && segVoices[Number(gm[1]) - 1]) pairedVoice = segVoices[Number(gm[1]) - 1].path;
+          }
+          if (pairedVoice) {
+            const ext = path.extname(pairedVoice);
+            const aname = `${prefix}_${w.label}_配音${ext}`;
+            fs.copyFileSync(pairedVoice, path.join(kitDir, aname));
+            line += `配音：${aname}`;
+            const srtPath = pairedVoice.replace(/\.[^.]+$/, '') + '.srt';
+            if (fs.existsSync(srtPath)) {
+              const sname = `${prefix}_${w.label}_字幕.srt`;
+              fs.copyFileSync(srtPath, path.join(kitDir, sname));
+              line += ` ｜ 字幕：${sname}`;
+            }
+          } else {
+            line += '（无配音，纯画面段）';
+          }
+          guide.push(line);
+        });
+        fs.writeFileSync(path.join(kitDir, '组装说明.txt'), guide.join('\n'), 'utf8');
+      }
+    } catch (e2) {
+      kitDir = '';
+      // 素材包导出失败不影响成片返回
+    }
+
     const st = fs.statSync(dest);
     ok = true;
     return json(res, 200, {
       ok: true,
       output: dest,
       size: st.size,
+      kitDir,
       duration: Math.round(totalDur * 100) / 100,
       transition,
       hasHead,
