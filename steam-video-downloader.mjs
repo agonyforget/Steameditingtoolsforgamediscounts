@@ -1042,23 +1042,45 @@ function handleVoiceUpload(req, res, urlObj) {
     return json(res, 400, { error: `无法创建配音目录：${e.message}` });
   }
   const target = path.join(dir, name);
-  const ws = fs.createWriteStream(target);
+  // 先写临时 .part，完整接收成功后才落为正式文件：
+  // 网络中断/出错只清理半成品，绝不破坏可能已存在的正式文件。
+  const part = `${target}.part`;
+  let responded = false;
+  const fail = (code, msg) => {
+    if (responded) return;
+    responded = true;
+    try { ws.destroy(); } catch { /* ignore */ }
+    try { fs.rmSync(part, { force: true }); } catch { /* ignore */ }
+    return json(res, code, { error: msg });
+  };
+  const ws = fs.createWriteStream(part);
   req.pipe(ws);
   ws.on('finish', () => {
+    if (responded) return;
     try {
+      // 覆盖同名正式文件前先删旧文件（Windows rename 不允许覆盖）
+      try { if (fs.existsSync(target)) fs.rmSync(target, { force: true }); } catch { /* ignore */ }
+      fs.renameSync(part, target);
       const st = fs.statSync(target);
+      responded = true;
       return json(res, 200, { ok: true, name, size: st.size });
     } catch (e) {
-      return json(res, 500, { error: `保存失败：${e.message}` });
+      return fail(500, `保存失败：${e.message}`);
     }
   });
-  ws.on('error', (e) => {
-    try { fs.rmSync(target, { force: true }); } catch { /* ignore */ }
-    return json(res, 500, { error: `写入失败：${e.message}` });
-  });
-  req.on('aborted', () => {
-    try { ws.destroy(); fs.rmSync(target, { force: true }); } catch { /* ignore */ }
-  });
+  ws.on('error', (e) => fail(500, `写入失败：${e.message}`));
+  req.on('aborted', () => fail(400, '上传中断（连接被断开）'));
+  req.on('error', () => fail(400, '上传中断（请求错误）'));
+  // 长时间无数据时兜底（10 分钟无进展视为异常）
+  let lastChunk = Date.now();
+  req.on('data', () => { lastChunk = Date.now(); });
+  const idleTimer = setInterval(() => {
+    if (Date.now() - lastChunk > 600000) {
+      clearInterval(idleTimer);
+      fail(400, '上传超时（长时间无数据）');
+    }
+  }, 30000);
+  req.on('end', () => clearInterval(idleTimer));
 }
 
 // GET /api/voice/delete?name=xx.mp3&dir=... ：删除一个配音文件。
@@ -3161,67 +3183,143 @@ function deleteVoiceFile(i) {
     .catch(function(e){ vStatus('删除失败：' + e.message); });
 }
 
+var voiceUploadItems = [];      // { f, state, pct, size, err, tries }
+var voiceQueue = [];
+var voiceRunning = 0;
+var VOICE_CONC = 2;             // 并发上传数（降低避免网络错误）
+var VOICE_MAX_TRIES = 3;        // 每文件最大尝试次数（自动重试）
+
 function uploadVoiceFiles(fileList) {
   var files = Array.prototype.slice.call(fileList || []).filter(function(f){ return isVoiceExt(f.name); });
   var bad = (fileList ? fileList.length : 0) - files.length;
   if (!files.length) { vStatus('没有可上传的音频文件（支持 mp3/wav/m4a/aac/flac/ogg/wma/opus）'); return; }
   var dir = voiceDirVal();
-  var html = '';
-  var items = files.map(function(f){
-    return { f: f, state: '排队', pct: 0 };
+  files.forEach(function(f){
+    voiceUploadItems.push({ f: f, state: '排队', pct: 0, size: 0, err: '', tries: 0 });
+    voiceQueue.push(voiceUploadItems.length - 1);
   });
-  items.forEach(function(it){
-    html += '<div class="file"><span class="fn">' + esc(it.f.name) + '</span><span class="sz" data-sz>排队中</span></div>';
+  renderVoiceUploadList();
+  if (bad) vStatus('已跳过 ' + bad + ' 个非音频文件；' + files.length + ' 个排队上传…');
+  else vStatus('开始上传 ' + files.length + ' 个文件……');
+  voicePump();
+}
+
+function renderVoiceUploadList() {
+  if (!voiceUploadItems.length) { voiceUploadListEl.innerHTML = ''; return; }
+  var html = '';
+  voiceUploadItems.forEach(function(it, i) {
+    var txt = it.state === '排队' ? '排队中'
+      : it.state === '上传中' ? (it.pct > 0 ? it.pct + '%' : '上传中…')
+      : it.state === '完成' ? '✅ ' + formatSizeClient(it.size)
+      : '❌ ' + (it.err || '失败');
+    var btn = it.state === '失败' ? ' <button class="ghost" style="padding:2px 8px" onclick="retryVoiceUpload(' + i + ')">重试</button>' : '';
+    html += '<div class="file" data-idx="' + i + '"><span class="fn">' + esc(it.f.name) + '</span><span class="sz">' + txt + btn + '</span></div>';
   });
   voiceUploadListEl.innerHTML = html;
-  if (bad) vStatus('已跳过 ' + bad + ' 个非音频文件');
-  else vStatus('开始上传 ' + items.length + ' 个文件……');
+}
+function setVoiceRow(idx, text) {
+  var el = voiceUploadListEl.querySelector('.file[data-idx="' + idx + '"] .sz');
+  if (el) el.innerHTML = text;
+}
+function retryVoiceUpload(i) {
+  var it = voiceUploadItems[i];
+  if (!it || it.state === '上传中') return;
+  it.tries = 0;
+  it.err = '';
+  it.pct = 0;
+  it.state = '排队';
+  voiceQueue.push(i);
+  renderVoiceUploadList();
+  voicePump();
+}
 
-  var els = voiceUploadListEl.querySelectorAll('.file');
-  var run = function(it, idx) {
-    var el = els[idx];
-    var szEl = el.querySelector('[data-sz]');
-    var xhr = new XMLHttpRequest();
-    xhr.open('POST', '/api/voice/upload?name=' + encodeURIComponent(it.f.name) + '&dir=' + encodeURIComponent(dir));
-    xhr.upload.onprogress = function(ev) {
-      if (ev.lengthComputable) {
-        it.pct = Math.round((ev.loaded / ev.total) * 100);
-        szEl.textContent = it.pct + '%';
-      }
-    };
-    xhr.onload = function() {
-      var res;
-      try { res = JSON.parse(xhr.responseText); } catch (e) { res = { error: '响应异常' }; }
-      if (xhr.status === 200 && res.ok) { it.state = '完成'; szEl.textContent = '✅ ' + formatSizeClient(res.size); }
-      else { it.state = '失败'; szEl.textContent = '❌ ' + (res.error || '上传失败'); }
-    };
-    xhr.onerror = function() { it.state = '失败'; szEl.textContent = '❌ 网络错误'; };
-    xhr.send(it.f);
-  };
-  // 并发 3 个上传
-  var idx = 0;
-  var workers = [];
-  for (var w = 0; w < 3 && w < items.length; w++) {
-    workers.push((function(){ return new Promise(function(done){
-      var next = function(){
-        if (idx >= items.length) { done(); return; }
-        var i = idx++;
-        var it = items[i];
-        run(it, i);
-        // 轮询该项完成（XHR 无 Promise，用 setInterval 判断）
-        var timer = setInterval(function(){
-          if (it.state === '完成' || it.state === '失败') { clearInterval(timer); next(); }
-        }, 200);
-      };
-      next();
-    }); })());
+function voicePump() {
+  while (voiceRunning < VOICE_CONC && voiceQueue.length) {
+    var i = voiceQueue.shift();
+    var it = voiceUploadItems[i];
+    if (!it || it.state === '完成') continue;
+    voiceRunning++;
+    voiceDoUpload(i);
   }
-  Promise.all(workers).then(function(){
-    var done = items.filter(function(it){ return it.state === '完成'; }).length;
-    vStatus('上传完成：成功 ' + done + '/' + items.length);
-    loadVoiceFiles();
-    setTimeout(function(){ voiceUploadListEl.innerHTML = ''; }, 3000);
+  // 全部空闲且无排队时收尾
+  if (voiceRunning === 0 && !voiceQueue.length) {
+    var done = voiceUploadItems.filter(function(x){ return x.state === '完成'; }).length;
+    var fail = voiceUploadItems.filter(function(x){ return x.state === '失败'; }).length;
+    if (done + fail === voiceUploadItems.length) {
+      if (fail > 0) {
+        vStatus('上传完成：成功 ' + done + ' / 失败 ' + fail + '（失败项可点"重试"，网络恢复后重传；成功文件已保留）');
+      } else {
+        vStatus('上传完成：全部 ' + done + ' 个成功 ✓');
+        loadVoiceFiles();
+        setTimeout(function(){ if (!voiceUploadItems.some(function(x){ return x.state !== '完成'; })) { voiceUploadItems = []; renderVoiceUploadList(); } }, 4000);
+      }
+    }
+  }
+}
+
+function voiceFinish(i, ok, errText) {
+  voiceRunning--;
+  var it = voiceUploadItems[i];
+  if (ok) {
+    it.state = '完成';
+  } else if (it.tries < VOICE_MAX_TRIES - 1) {
+    it.tries++;
+    it.state = '排队';
+    it.err = (errText || '失败') + '（第 ' + (it.tries + 1) + ' 次尝试）';
+    renderVoiceUploadList();
+    setTimeout(function(){ voiceQueue.push(i); voicePump(); }, 800);
+    return;
+  } else {
+    it.state = '失败';
+    it.err = errText || '网络错误';
+    renderVoiceUploadList();
+  }
+  voicePump();
+}
+
+function voiceDoUpload(i) {
+  var it = voiceUploadItems[i];
+  if (!it) { voiceFinish(i, false, '文件已失效'); return; }
+  it.state = '上传中';
+  it.pct = 0;
+  setVoiceRow(i, '上传中…');
+  var dir = voiceDirVal();
+  var xhr = new XMLHttpRequest();
+  xhr.timeout = 180000; // 单个大文件最长 3 分钟
+  xhr.open('POST', '/api/voice/upload?name=' + encodeURIComponent(it.f.name) + '&dir=' + encodeURIComponent(dir));
+  var finished = false;
+  var doneOnce = function(fn) { return function(){ if (finished) return; finished = true; fn(); }; };
+  xhr.upload.onprogress = function(ev) {
+    if (ev.lengthComputable) {
+      it.pct = Math.round((ev.loaded / ev.total) * 100);
+      setVoiceRow(i, it.pct + '%');
+    }
+  };
+  xhr.onload = doneOnce(function() {
+    var res;
+    try { res = JSON.parse(xhr.responseText); } catch (e) { res = { error: '响应异常' }; }
+    if (xhr.status === 200 && res.ok) {
+      it.size = res.size;
+      setVoiceRow(i, '✅ ' + formatSizeClient(res.size));
+      voiceFinish(i, true);
+    } else {
+      setVoiceRow(i, '❌');
+      voiceFinish(i, false, res.error || ('HTTP ' + xhr.status));
+    }
   });
+  xhr.onerror = doneOnce(function() {
+    setVoiceRow(i, '❌');
+    voiceFinish(i, false, '网络错误（连接中断）');
+  });
+  xhr.ontimeout = doneOnce(function() {
+    setVoiceRow(i, '❌');
+    voiceFinish(i, false, '上传超时');
+  });
+  try {
+    xhr.send(it.f);
+  } catch (e) {
+    doneOnce(function(){ voiceFinish(i, false, '发送失败：' + e.message); })();
+  }
 }
 
 document.getElementById('voicePick').addEventListener('click', function(){ voiceFileInput.click(); });
@@ -3703,21 +3801,28 @@ refreshProd();
 
 function json(res, status, body) {
   const text = JSON.stringify(body);
-  res.writeHead(status, {
-    'Content-Type': 'application/json; charset=utf-8',
-    'Content-Length': Buffer.byteLength(text),
-    'Cache-Control': 'no-store, no-cache, must-revalidate',
-  });
-  res.end(text);
+  // 客户端可能已断连（上传中断/网络错误），写失败不得抛出导致进程崩溃
+  res.on('error', () => {});
+  try {
+    res.writeHead(status, {
+      'Content-Type': 'application/json; charset=utf-8',
+      'Content-Length': Buffer.byteLength(text),
+      'Cache-Control': 'no-store, no-cache, must-revalidate',
+    });
+    res.end(text);
+  } catch { /* socket 已断开，忽略 */ }
 }
 
 function html(res) {
-  res.writeHead(200, {
-    'Content-Type': 'text/html; charset=utf-8',
-    'Content-Length': Buffer.byteLength(PAGE),
-    'Cache-Control': 'no-store, no-cache, must-revalidate',
-  });
-  res.end(PAGE);
+  res.on('error', () => {});
+  try {
+    res.writeHead(200, {
+      'Content-Type': 'text/html; charset=utf-8',
+      'Content-Length': Buffer.byteLength(PAGE),
+      'Cache-Control': 'no-store, no-cache, must-revalidate',
+    });
+    res.end(PAGE);
+  } catch { /* socket 已断开，忽略 */ }
 }
 
 function readBody(req) {
