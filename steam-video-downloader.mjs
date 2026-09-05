@@ -1771,6 +1771,48 @@ function buildCardLines(c) {
   return lines;
 }
 
+// 生成一张卡片的滤镜元素串数组（左上角白底卡片），显示窗口 [startSec, endSec]。
+// 供"独立叠加"与"时间线内联"共用。
+function buildCardFilters(card, startSec, endSec) {
+  const X = 24;
+  const Y = 24;
+  const PAD_X = 14;
+  const PAD_TOP = 12;
+  const PAD_BOTTOM = 12;
+  const titleFont = resolveCnFont(true);
+  const bodyFont = resolveCnFont(false);
+  const start = Math.max(0, Number(startSec) || 0);
+  const end = Math.max(start + 0.2, Number(endSec) || start + 5);
+  const enable = `enable='between(t,${start.toFixed(3)},${end.toFixed(3)})'`;
+  const lines = buildCardLines(card);
+  let w = 300;
+  lines.forEach((l) => {
+    const len = String(l.text).length;
+    const est = l.fs === 0 ? 28 * Math.min(len, 22) : 19 * len;
+    if (est > w) w = est;
+  });
+  w = Math.min(640, Math.max(300, w + PAD_X * 2 + 16));
+  const rowHs = lines.map((l) => (l.fs === 0 ? 44 : 28));
+  const h = PAD_TOP + rowHs.reduce((a, b) => a + b, 0) + PAD_BOTTOM;
+  const out = [];
+  out.push(`drawbox=x=${X - 3}:y=${Y - 3}:w=${w + 6}:h=${h + 6}:color=0xF2A0B8@0.95:t=fill:${enable}`);
+  out.push(`drawbox=x=${X}:y=${Y}:w=${w}:h=${h}:color=white@0.45:t=fill:${enable}`);
+  let y = Y + PAD_TOP;
+  lines.forEach((l, li) => {
+    const safeText = String(l.text).replace(/%/g, '％');
+    if (l.fs === 0) {
+      const len = String(l.text).length;
+      const fs = len > 26 ? 19 : len > 18 ? 23 : 28;
+      out.push(`drawtext=fontfile='${escF(titleFont)}':text='${escF(safeText)}':x=${X + PAD_X}:y=${y}:fontsize=${fs}:fontcolor=black:${enable}`);
+    } else {
+      const fs = l.color === '#C0392B' ? 22 : 20;
+      out.push(`drawtext=fontfile='${escF(bodyFont)}':text='${escF(safeText)}':x=${X + PAD_X}:y=${y + 2}:fontsize=${fs}:fontcolor=${l.color || 'black'}:${enable}`);
+    }
+    y += rowHs[li];
+  });
+  return out;
+}
+
 // POST /api/cards-overlay ：把多张游戏卡片按时间窗口叠加到视频左上角。
 // body: { video, cards: [{start,end,name,price,now,discount,deadline,rating,tag1,tag2,raw?}], outDir, outName? }
 async function handleCardsOverlay(req, res) {
@@ -1806,38 +1848,7 @@ async function handleCardsOverlay(req, res) {
 
   const fc = [];
   cards.forEach((c) => {
-    const start = Math.max(0, Number(c.start) || 0);
-    const end = Math.max(start + 0.2, Number(c.end) || start + 5);
-    const enable = `enable='between(t,${start.toFixed(3)},${end.toFixed(3)})'`;
-    const lines = buildCardLines(c);
-    // 卡片宽：按最长行粗估，至少 300，最多 640
-    let w = 300;
-    lines.forEach((l) => {
-      const len = String(l.text).length;
-      const est = l.fs === 0 ? 28 * Math.min(len, 22) : 19 * len;
-      if (est > w) w = est;
-    });
-    w = Math.min(640, Math.max(300, w + PAD_X * 2 + 16));
-    // 行高
-    const rowHs = lines.map((l) => (l.fs === 0 ? 44 : 28));
-    const h = PAD_TOP + rowHs.reduce((a, b) => a + b, 0) + PAD_BOTTOM;
-    // 白底 + 红粉边框（外框色 3px + 内白半透明）＋ 文本行（全部挂同一时间窗口）
-    fc.push(`drawbox=x=${X - 3}:y=${Y - 3}:w=${w + 6}:h=${h + 6}:color=0xF2A0B8@0.95:t=fill:${enable}`);
-    fc.push(`drawbox=x=${X}:y=${Y}:w=${w}:h=${h}:color=white@0.45:t=fill:${enable}`);
-    let y = Y + PAD_TOP;
-    lines.forEach((l, li) => {
-      // 半角 % 换成全角 ％，规避 drawtext 多层转义问题；其余字符 escF 处理
-      const safeText = String(l.text).replace(/%/g, '％');
-      if (l.fs === 0) {
-        const len = String(l.text).length;
-        const fs = len > 26 ? 19 : len > 18 ? 23 : 28;
-        fc.push(`drawtext=fontfile='${escF(titleFont)}':text='${escF(safeText)}':x=${X + PAD_X}:y=${y}:fontsize=${fs}:fontcolor=black:${enable}`);
-      } else {
-        const fs = l.color === '#C0392B' ? 22 : 20;
-        fc.push(`drawtext=fontfile='${escF(bodyFont)}':text='${escF(safeText)}':x=${X + PAD_X}:y=${y + 2}:fontsize=${fs}:fontcolor=${l.color || 'black'}:${enable}`);
-      }
-      y += rowHs[li];
-    });
+    fc.push(...buildCardFilters(c, c.start, c.end));
   });
 
   const chain = `[0:v]${fc.join(',')}[vout]`;
@@ -2217,7 +2228,7 @@ async function handleComposeTimeline(req, res) {
         fc.push(`[${prev}][v${p}]xfade=transition=fade:duration=${transition.toFixed(3)}:offset=${offset.toFixed(3)}[x${p}]`);
         prev = `x${p}`;
       }
-      fc.push(`[${prev}]format=yuv420p[vout]`);
+      fc.push(`[${prev}]format=yuv420p`);
     } else {
       // 硬切：filter concat（统一帧率后串联）
       let prev = 'v0';
@@ -2225,8 +2236,25 @@ async function handleComposeTimeline(req, res) {
         fc.push(`[${prev}][v${i}]concat=n=2:v=1:a=0[vx${i}]`);
         prev = `vx${i}`;
       }
-      fc.push(`[${prev}]format=yuv420p[vout]`);
+      fc.push(`[${prev}]format=yuv420p`);
     }
+    // 自动叠加游戏卡片：games[gi] 显示在其对应正片段落窗口内（内联算段起点，避免 TDZ）
+    const tailEl = fc[fc.length - 1];
+    const cardEls = [];
+    const delayP = (pos) => {
+      if (pos === 0) return 0;
+      const a = durs.slice(0, pos).reduce((x, y) => x + y, 0);
+      return a - pos * transition;
+    };
+    if (games.length) {
+      games.forEach((g, gi) => {
+        const pos = hasHead ? 1 + gi : gi;
+        if (pos >= nSeg) return;
+        const wStart = delayP(pos);
+        cardEls.push(...buildCardFilters(g, wStart, wStart + durs[pos]));
+      });
+    }
+    fc[fc.length - 1] = cardEls.length ? `${tailEl},${cardEls.join(',')}[vout]` : `${tailEl}[vout]`;
     ins.push('-filter_complex', fc.join(';'), '-map', '[vout]', '-c:v', 'libx264', '-crf', '18', '-preset', 'medium', '-pix_fmt', 'yuv420p', video);
     const vErrFile = path.join(SCRIPT_DIR, `.tmp_tlerr_${Date.now()}_${randomUUID().slice(0, 8)}.txt`);
     try {
