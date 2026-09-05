@@ -1437,6 +1437,13 @@ function mapExcelGrid(grid) {
       obj[def.key] = (cells[idx] !== undefined ? String(cells[idx]) : '').trim();
     }
     if (!obj.name && !obj.price && !obj.now) continue; // 无有效内容
+    // 保留原始全部列（key价格/语言等额外字段，供卡片渲染扩展）
+    const raw = {};
+    headers.forEach((h, i) => {
+      const hh = String(h).trim();
+      if (hh && cells[i] !== undefined && String(cells[i]).trim()) raw[hh] = String(cells[i]).trim();
+    });
+    obj.raw = raw;
     rows.push(obj);
   }
   return { headers, colIdx, rows, total: rows.length };
@@ -1699,6 +1706,174 @@ async function handleComposeAuto(req, res) {
   }
 }
 
+// ── C1 游戏卡片：drawtext 白底卡片，按段落窗口叠加到成片 ──────────────────────
+
+// 中文字体探测（标题粗体优先，正文常规）。
+function resolveCnFont(bold) {
+  const dir = 'C:/Windows/Fonts';
+  const cands = bold
+    ? ['msyhbd.ttc', 'msyh.ttc', 'simhei.ttf', 'msyhl.ttc', 'simsun.ttc']
+    : ['msyh.ttc', 'msyhbd.ttc', 'simhei.ttf', 'simsun.ttc', 'msyhl.ttc'];
+  for (const f of cands) {
+    try { if (fs.existsSync(path.join(dir, f))) return `${dir}/${f}`; } catch { /* ignore */ }
+  }
+  return null;
+}
+
+// filter 值转义：反斜杠/冒号/百分号/单引号（ffmpeg 滤镜参数层 av_opt 的转义；% 用 \% 转义）
+function escF(v) {
+  return String(v ?? '').replace(/\\/g, '\\\\').replace(/:/g, '\\:').replace(/%/g, '\\%').replace(/'/g, "\\'");
+}
+
+// 好评率显示：0.95 → 95.00%；83 → 83.00%；带 % 原样
+function fmtRating(v) {
+  const s = String(v ?? '').trim();
+  if (!s) return '';
+  if (s.includes('%')) return s;
+  const n = Number(s);
+  if (Number.isNaN(n)) return s;
+  const p = n <= 1 ? n * 100 : n;
+  return `${p.toFixed(2)}%`;
+}
+
+// 从 raw 额外列里探测补充信息（key 价格 / 中文支持），列名模糊匹配。
+function probeExtra(raw) {
+  let keyPrice = '';
+  let hasCn = '';
+  if (raw && typeof raw === 'object') {
+    for (const [k, v] of Object.entries(raw)) {
+      const kk = String(k);
+      const vv = String(v ?? '');
+      if (!keyPrice && /key|激活码|密钥/i.test(kk)) keyPrice = vv;
+      if (!hasCn && (/中文|语言|简中|汉化|字幕/i.test(kk) || /中文|简中|汉化/i.test(vv))) hasCn = '有中文';
+    }
+  }
+  return { keyPrice, hasCn };
+}
+
+// 由卡片字段生成显示行：{ text, fs(字号), color }
+function buildCardLines(c) {
+  const lines = [];
+  lines.push({ text: String(c.name || '未知游戏').trim(), fs: 0, bold: true });
+  const priceBits = [];
+  if (c.price) priceBits.push(`原${c.price}`);
+  if (c.now) priceBits.push(`现${c.now}`);
+  if (c.discount) priceBits.push(String(c.discount));
+  if (c.deadline) priceBits.push(`截止${c.deadline}`);
+  if (priceBits.length) lines.push({ text: priceBits.join(' '), fs: 1, color: '#C0392B' });
+  const tags = [String(c.tag1 || '').trim(), String(c.tag2 || '').trim()].filter(Boolean);
+  if (tags.length) lines.push({ text: `标签：${tags.join(' ')}`, fs: 1, color: '#444444' });
+  const rating = fmtRating(c.rating);
+  if (rating) lines.push({ text: `好评率：${rating}`, fs: 1, color: '#333333' });
+  const extra = probeExtra(c.raw);
+  if (extra.keyPrice) lines.push({ text: `Key价格 ${extra.keyPrice}`, fs: 1, color: '#333333' });
+  if (extra.hasCn) lines.push({ text: extra.hasCn, fs: 1, color: '#333333' });
+  return lines;
+}
+
+// POST /api/cards-overlay ：把多张游戏卡片按时间窗口叠加到视频左上角。
+// body: { video, cards: [{start,end,name,price,now,discount,deadline,rating,tag1,tag2,raw?}], outDir, outName? }
+async function handleCardsOverlay(req, res) {
+  let payload;
+  try {
+    payload = JSON.parse(await readBody(req));
+  } catch {
+    return json(res, 400, { error: '请求体不是合法 JSON' });
+  }
+  const video = String(payload.video || '').trim();
+  const cards = Array.isArray(payload.cards) ? payload.cards : [];
+  if (!video) return json(res, 400, { error: '请选择要叠加卡片的视频' });
+  if (!fs.existsSync(video)) return json(res, 404, { error: `视频不存在：${video}` });
+  if (!cards.length) return json(res, 400, { error: '请至少提供一张卡片' });
+  const outDir = String(payload.outDir || '').trim() || 'E:/worddeepseek/videocut/product';
+  const ff = resolveFfmpeg();
+  if (!ff) return json(res, 500, { error: '未找到 ffmpeg' });
+  try { fs.mkdirSync(outDir, { recursive: true }); } catch (e) { return json(res, 400, { error: `无法创建成品目录：${e.message}` }); }
+  const titleFont = resolveCnFont(true);
+  const bodyFont = resolveCnFont(false);
+  if (!titleFont || !bodyFont) return json(res, 500, { error: '未找到中文字体（需系统装有微软雅黑/黑体）' });
+
+  const baseName = (payload.outName && String(payload.outName).trim())
+    ? String(payload.outName).trim()
+    : `${path.basename(video).replace(/\.[^.]+$/, '')}_卡片版`;
+  const dest = uniquePath(path.join(outDir, `${sanitizeName(baseName)}.mp4`));
+
+  const X = 24; // 卡片左上角
+  const Y = 24;
+  const PAD_X = 14;
+  const PAD_TOP = 12;
+  const PAD_BOTTOM = 12;
+
+  const fc = [];
+  cards.forEach((c) => {
+    const start = Math.max(0, Number(c.start) || 0);
+    const end = Math.max(start + 0.2, Number(c.end) || start + 5);
+    const enable = `enable='between(t,${start.toFixed(3)},${end.toFixed(3)})'`;
+    const lines = buildCardLines(c);
+    // 卡片宽：按最长行粗估，至少 300，最多 640
+    let w = 300;
+    lines.forEach((l) => {
+      const len = String(l.text).length;
+      const est = l.fs === 0 ? 28 * Math.min(len, 22) : 19 * len;
+      if (est > w) w = est;
+    });
+    w = Math.min(640, Math.max(300, w + PAD_X * 2 + 16));
+    // 行高
+    const rowHs = lines.map((l) => (l.fs === 0 ? 44 : 28));
+    const h = PAD_TOP + rowHs.reduce((a, b) => a + b, 0) + PAD_BOTTOM;
+    // 白底 + 红粉边框（外框色 3px + 内白半透明）＋ 文本行（全部挂同一时间窗口）
+    fc.push(`drawbox=x=${X - 3}:y=${Y - 3}:w=${w + 6}:h=${h + 6}:color=0xF2A0B8@0.95:t=fill:${enable}`);
+    fc.push(`drawbox=x=${X}:y=${Y}:w=${w}:h=${h}:color=white@0.45:t=fill:${enable}`);
+    let y = Y + PAD_TOP;
+    lines.forEach((l, li) => {
+      // 半角 % 换成全角 ％，规避 drawtext 多层转义问题；其余字符 escF 处理
+      const safeText = String(l.text).replace(/%/g, '％');
+      if (l.fs === 0) {
+        const len = String(l.text).length;
+        const fs = len > 26 ? 19 : len > 18 ? 23 : 28;
+        fc.push(`drawtext=fontfile='${escF(titleFont)}':text='${escF(safeText)}':x=${X + PAD_X}:y=${y}:fontsize=${fs}:fontcolor=black:${enable}`);
+      } else {
+        const fs = l.color === '#C0392B' ? 22 : 20;
+        fc.push(`drawtext=fontfile='${escF(bodyFont)}':text='${escF(safeText)}':x=${X + PAD_X}:y=${y + 2}:fontsize=${fs}:fontcolor=${l.color || 'black'}:${enable}`);
+      }
+      y += rowHs[li];
+    });
+  });
+
+  const chain = `[0:v]${fc.join(',')}[vout]`;
+  const args = ['-y', '-loglevel', 'error', '-i', video, '-filter_complex', chain, '-map', '[vout]', '-map', '0:a?', '-c:v', 'libx264', '-crf', '18', '-preset', 'medium', '-pix_fmt', 'yuv420p', '-c:a', 'copy', dest];
+  // 排错：把 ffmpeg 报错写文件，失败时带回详细原因
+  const errFile = path.join(SCRIPT_DIR, `.tmp_cards_${Date.now()}_${randomUUID().slice(0, 8)}.txt`);
+  try {
+    const errFd = fs.openSync(errFile, 'w');
+    try {
+      await new Promise((resolve, reject) => {
+        let child;
+        try {
+          child = spawn(ff, args, { stdio: ['ignore', 'ignore', errFd], windowsHide: true });
+        } catch (e2) { return reject(e2); }
+        child.on('error', reject);
+        child.on('close', (code) => (code === 0 ? resolve() : reject(new Error(`退出码 ${code}`))));
+      });
+    } finally {
+      try { fs.closeSync(errFd); } catch { /* ignore */ }
+    }
+    if (!fs.existsSync(dest)) throw new Error('合成失败（未生成文件）');
+    const st = fs.statSync(dest);
+    return json(res, 200, { ok: true, output: dest, size: st.size, cards: cards.length });
+  } catch (e) {
+    let detail = e.message;
+    try {
+      const t = fs.readFileSync(errFile, 'utf8');
+      const lines = t.split(/\r?\n/).filter((l) => l.trim()).slice(-8).join(' | ');
+      if (lines) detail += ` ｜ ffmpeg: ${lines}`;
+    } catch { /* ignore */ }
+    return json(res, 502, { error: `卡片叠加失败：${detail}` });
+  } finally {
+    try { fs.rmSync(errFile, { force: true }); } catch { /* ignore */ }
+  }
+}
+
 // GET /api/materials?dir=... ：列出素材目录的 mp4（附带解析出的游戏名）。
 function handleMaterials(urlObj, res) {
   const dir = urlObj.searchParams.get('dir') || DEFAULT_DIR;
@@ -1927,6 +2102,30 @@ https://store.steampowered.com/app/648800/Raft/"></textarea>
     <span id="autoStatus"></span>
   </div>
   <div id="autoResult"></div>
+</div>
+
+<div class="card">
+  <h2>🃏 游戏卡片叠加（跟随段落）</h2>
+  <div class="sub" style="margin:0 0 8px">
+    在成片视频左上角叠加游戏信息卡片（白底半透明 + 红粉边框）。卡片数据来自已解析的 Excel；
+    每张卡片填「开始/结束」时间（对应游戏段落）。若刚生成过"自动贴合成片"，可点「按段落自动排布」自动填入每段窗口。
+  </div>
+  <div class="row">
+    <input type="text" id="cardVideo" placeholder="成片视频路径（可用上方自动贴合成片结果，或手动填）" style="flex:1" />
+    <button id="cardUseAuto" class="ghost" title="把上方自动贴合成片结果填入视频路径并排布窗口">⏱️ 用上方成片</button>
+  </div>
+  <div class="row">
+    <input type="text" id="cardOutDir" placeholder="输出目录（默认 E:/worddeepseek/videocut/product）" style="flex:1" />
+    <input type="text" id="cardOutName" placeholder="输出名（留空自动）" style="flex:1" />
+  </div>
+  <div class="row">
+    <button id="cardLoadExcel" class="ghost">📊 从已解析 Excel 载入卡片</button>
+    <button id="cardAutoTime" class="ghost">⏱️ 按段落自动排布时间</button>
+    <button id="cardGen" class="accent">▶ 生成带卡片视频</button>
+    <span id="cardStatus"></span>
+  </div>
+  <div id="cardRows"></div>
+  <div id="cardResult"></div>
 </div>
 
 <div class="card">
@@ -2533,6 +2732,7 @@ autoGenBtn.addEventListener('click', function(){
       autoGenBtn.disabled = false;
       if (res.error) { aStatus('生成失败'); autoResultEl.innerHTML = '<div class="errmsg">' + esc(res.error) + '</div>'; return; }
       aStatus('完成 ✓');
+      window.__autoResult = res; // 供"游戏卡片叠加"联动
       var html = '<div class="meta" style="color:#1a7a3a;margin-top:6px">✅ 成片已生成：<b>' + esc(res.output) + '</b>（' + formatSizeClient(res.size) + '，总时长约 ' + Math.round(res.duration) + ' 秒）</div>';
       (res.segments || []).forEach(function(s){
         html += '<div class="meta">段 ' + s.index + '：配音起点 ≈ ' + Math.round(s.delayMs / 1000) + 's（' + esc(s.voice) + '）</div>';
@@ -2540,6 +2740,106 @@ autoGenBtn.addEventListener('click', function(){
       autoResultEl.innerHTML = html;
     })
     .catch(function(e){ autoGenBtn.disabled = false; aStatus('生成失败'); autoResultEl.innerHTML = '<div class="errmsg">请求失败：' + esc(e.message) + '</div>'; });
+});
+
+// ===== 游戏卡片叠加（C1） =====
+var cardVideoInput = document.getElementById('cardVideo');
+var cardOutDirInput = document.getElementById('cardOutDir');
+var cardOutNameInput = document.getElementById('cardOutName');
+var cardRowsEl = document.getElementById('cardRows');
+var cardStatusEl = document.getElementById('cardStatus');
+var cardResultEl = document.getElementById('cardResult');
+var cardGenBtn = document.getElementById('cardGen');
+var cardList = []; // { name, price, now, rating, discount, deadline, tag1, tag2, raw, start, end }
+window.__autoResult = null;
+
+function cStatus2(t) { cardStatusEl.textContent = t || ''; }
+
+document.getElementById('cardLoadExcel').addEventListener('click', function(){
+  var d = window.__excelData;
+  if (!d || !d.rows || !d.rows.length) { cStatus2('请先在「📊 Excel 游戏数据」解析工作表'); return; }
+  cardList = d.rows.map(function(r){ return { name: r.name, price: r.price, now: r.now, rating: r.rating, discount: r.discount, deadline: r.deadline, tag1: r.tag1, tag2: r.tag2, raw: r.raw || null, start: '', end: '' }; });
+  renderCardRows();
+  cStatus2('已载入 ' + cardList.length + ' 张卡片（来自 Excel）');
+});
+
+document.getElementById('cardUseAuto').addEventListener('click', function(){
+  var ar = window.__autoResult;
+  if (!ar || !ar.output) { cStatus2('请先生成自动贴合成片'); return; }
+  cardVideoInput.value = ar.output;
+  if (!cardOutDirInput.value.trim()) {
+    cardOutDirInput.value = ar.output.replace(/[\\/][^\\/]+$/, '');
+  }
+  autoTimeCards(ar);
+  cStatus2('已使用上方成片，并按段落排布卡片时间');
+});
+
+document.getElementById('cardAutoTime').addEventListener('click', function(){
+  var ar = window.__autoResult;
+  if (!ar || !ar.output) { cStatus2('请先生成自动贴合成片（需要段落时间）'); return; }
+  autoTimeCards(ar);
+});
+
+function autoTimeCards(ar) {
+  var segs = ar.segments || [];
+  if (!segs.length) { cStatus2('成片结果缺少段落时间'); return; }
+  cardList.forEach(function(card, i) {
+    var s = segs[i];
+    if (!s) return;
+    var start = (s.delayMs || 0) / 1000;
+    var end = i + 1 < segs.length ? (segs[i + 1].delayMs || 0) / 1000 : (ar.duration || start + 5);
+    card.start = Math.round(start * 10) / 10;
+    card.end = Math.round(end * 10) / 10;
+  });
+  renderCardRows();
+}
+
+function renderCardRows() {
+  if (!cardList.length) { cardRowsEl.innerHTML = '<div class="empty">卡片为空：点「从已解析 Excel 载入卡片」</div>'; return; }
+  var html = '';
+  cardList.forEach(function(c, i) {
+    html += '<div class="it"><div class="top" style="align-items:center">';
+    html += '<span style="flex:1"><b>#' + (i + 1) + '</b> ' + esc(c.name || '(未命名)') + '</span>';
+    html += '<input type="text" data-ck="start" data-ci="' + i + '" value="' + esc(c.start) + '" placeholder="开始" style="width:80px" title="显示开始(秒)" />';
+    html += '<input type="text" data-ck="end" data-ci="' + i + '" value="' + esc(c.end) + '" placeholder="结束" style="width:80px" title="显示结束(秒)" />';
+    html += '<button class="danger" style="padding:3px 9px" onclick="removeCardRow(' + i + ')">×</button>';
+    html += '</div></div>';
+  });
+  cardRowsEl.innerHTML = html;
+  cardRowsEl.querySelectorAll('input[data-ck]').forEach(function(inp){
+    inp.addEventListener('input', function(){
+      var i = Number(inp.getAttribute('data-ci'));
+      if (cardList[i]) cardList[i][inp.getAttribute('data-ck')] = inp.value;
+    });
+  });
+}
+function removeCardRow(i) { cardList.splice(i, 1); renderCardRows(); }
+
+cardGenBtn.addEventListener('click', function(){
+  var video = cardVideoInput.value.trim();
+  if (!video) { cStatus2('请填写成片视频路径'); return; }
+  var cards = cardList.filter(function(c){
+    return c.start !== '' && c.end !== '' && (c.name || c.price);
+  }).map(function(c){
+    return { start: Number(c.start) || 0, end: Number(c.end) || 0, name: c.name, price: c.price, now: c.now, rating: c.rating, discount: c.discount, deadline: c.deadline, tag1: c.tag1, tag2: c.tag2, raw: c.raw };
+  });
+  if (!cards.length) { cStatus2('没有可用的卡片（请填开始/结束时间）'); return; }
+  cardGenBtn.disabled = true;
+  cStatus2('合成中（重编码叠加卡片，请稍候）……');
+  cardResultEl.innerHTML = '';
+  fetch('/api/cards-overlay', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ video: video, cards: cards, outDir: cardOutDirInput.value.trim(), outName: cardOutNameInput.value.trim() })
+  })
+    .then(function(r){ return r.json(); })
+    .then(function(res){
+      cardGenBtn.disabled = false;
+      if (res.error) { cStatus2('生成失败'); cardResultEl.innerHTML = '<div class="errmsg">' + esc(res.error) + '</div>'; return; }
+      cStatus2('完成 ✓');
+      cardResultEl.innerHTML = '<div class="meta" style="color:#1a7a3a;margin-top:6px">✅ 已生成：<b>' + esc(res.output) + '</b>（' + formatSizeClient(res.size) + '，' + res.cards + ' 张卡片）</div>';
+    })
+    .catch(function(e){ cardGenBtn.disabled = false; cStatus2('生成失败'); cardResultEl.innerHTML = '<div class="errmsg">请求失败：' + esc(e.message) + '</div>'; });
 });
 
 // ===== 剪辑拼接成片 =====
@@ -2905,6 +3205,8 @@ function main() {
       handleExcelPreview(urlObj, res);
     } else if (p === '/api/compose-auto' && req.method === 'POST') {
       handleComposeAuto(req, res).catch((e) => json(res, 500, { error: e.message }));
+    } else if (p === '/api/cards-overlay' && req.method === 'POST') {
+      handleCardsOverlay(req, res).catch((e) => json(res, 500, { error: e.message }));
     } else if (p === '/api/compose' && req.method === 'POST') {
       handleCompose(req, res).catch((e) => json(res, 500, { error: e.message }));
     } else if (p === '/api/open-folder') {
