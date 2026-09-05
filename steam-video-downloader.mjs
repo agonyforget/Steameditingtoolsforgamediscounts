@@ -3649,7 +3649,7 @@ function renderAutoRows() {
     var head = !!v.isHead;
     html += '<div class="it" data-vi="' + i + '"' + (head ? '' : ' draggable="true"') + '>';
     html += '<div class="top" style="align-items:center">';
-    html += '<span' + (head ? '' : ' style="cursor:grab;color:#888" title="按住行拖动排序")' : '') + '>⠿</span>';
+    html += '<span' + (head ? '' : ' style="cursor:grab;color:#888" title="按住行拖动排序"') + '>⠿</span>';
     html += '<span style="flex:1"><b>#' + (i + 1) + '</b>　🎙️ ' + esc(v.name) + '　<span style="color:#888;font-size:12px">(' + fmtDurSec(v.dur) + ')</span></span>';
     if (i === 0) {
       html += '<label class="chk" title="开场白：画面自动截取各素材未用片段拼成片头混剪；取消勾选则本段改为自己选素材播放"><input type="checkbox" data-field="isHead"' + (head ? ' checked' : '') + ' /> 片头开场（混剪）</label>';
