@@ -1555,6 +1555,22 @@ function parseSrtDuration(srtPath) {
   }
 }
 
+// 解析 srt 全部字幕条目：{ start, end, text }
+function parseSrtCues(srtPath) {
+  const out = [];
+  try {
+    const text = fs.readFileSync(srtPath, 'utf8');
+    const re = /(\d{1,2}):(\d{2}):(\d{2}),(\d{3})\s*-->\s*(\d{1,2}):(\d{2}):(\d{2}),(\d{3})(?:[^\n]*)\n([\s\S]*?)(?=\n\s*\n|$)/g;
+    let m;
+    while ((m = re.exec(text))) {
+      const toSec = (a, b, c, d) => Number(a) * 3600 + Number(b) * 60 + Number(c) + Number(d) / 1000;
+      const cue = m[9] ? m[9].replace(/\r/g, '').trim() : '';
+      out.push({ start: toSec(m[1], m[2], m[3], m[4]), end: toSec(m[5], m[6], m[7], m[8]), text: cue });
+    }
+  } catch { /* ignore */ }
+  return out;
+}
+
 // 配音时长：优先同目录同名 .srt（用户 B1 产物），否则实测音频时长。
 async function voiceDurationOf(voicePath) {
   const srt = voicePath.replace(/\.[^.]+$/, '') + '.srt';
@@ -2371,6 +2387,44 @@ async function handleComposeTimeline(req, res) {
       // 素材包导出失败不影响成片返回
     }
 
+    // ── 可选：烧录字幕进画面（burnSubs=true 时，把各段配音同名 srt 合并偏移后烧进成片）──
+    let burned = false;
+    if (payload.burnSubs) {
+      try {
+        const pairs = [];
+        if (hasHead) pairs.push({ voice: headVoicePath, label: '片头' });
+        segVoices.forEach((v, i) => pairs.push({ voice: v.path, label: `游戏${i + 1}` }));
+        const merged = [];
+        for (const p of pairs) {
+          const srtPath = p.voice.replace(/\.[^.]+$/, '') + '.srt';
+          if (!fs.existsSync(srtPath)) continue;
+          const win = windows.find((w) => w.label === p.label);
+          const off = win ? win.startMs / 1000 : 0;
+          for (const c of parseSrtCues(srtPath)) merged.push({ start: c.start + off, end: c.end + off, text: c.text });
+        }
+        merged.sort((a, b) => a.start - b.start);
+        if (merged.length) {
+          const srtName = `.tmp_burn_${Date.now()}_${randomUUID().slice(0, 6)}.srt`;
+          const srtFile = path.join(SCRIPT_DIR, srtName);
+          const lines = [];
+          merged.forEach((c, i) => { lines.push(String(i + 1), `${toSrtTime(c.start)} --> ${toSrtTime(c.end)}`, c.text, ''); });
+          fs.writeFileSync(srtFile, lines.join('\n'), 'utf8');
+          const out2 = `${dest}.burn.mp4`;
+          // subtitles 用相对文件名（ffmpeg cwd = 工具目录）；fontsdir 指向系统中文字体
+          const subArg = `subtitles='${srtName}':fontsdir='C\\:/Windows/Fonts':force_style='FontName=Microsoft YaHei,FontSize=17,MarginV=42,BorderStyle=1,Outline=2,Shadow=0'`;
+          await runLocal(ff, ['-y', '-loglevel', 'error', '-i', dest, '-vf', subArg, '-c:v', 'libx264', '-crf', '18', '-preset', 'medium', '-c:a', 'copy', out2], { timeoutMs: 900000 });
+          if (fs.existsSync(out2)) {
+            fs.rmSync(dest, { force: true });
+            fs.renameSync(out2, dest);
+            burned = true;
+          }
+          try { fs.rmSync(srtFile, { force: true }); } catch { /* ignore */ }
+        }
+      } catch (e3) {
+        burned = false; // 烧录失败不阻塞主流程（可用剪映素材包 srt 导入）
+      }
+    }
+
     const st = fs.statSync(dest);
     ok = true;
     return json(res, 200, {
@@ -2378,6 +2432,7 @@ async function handleComposeTimeline(req, res) {
       output: dest,
       size: st.size,
       kitDir,
+      burned,
       duration: Math.round(totalDur * 100) / 100,
       transition,
       hasHead,
@@ -2631,6 +2686,7 @@ https://store.steampowered.com/app/648800/Raft/"></textarea>
   <div class="row">
     <label class="chk">画面余量（秒）<input type="number" id="autoPadding" value="2" min="0" max="30" style="width:60px" /></label>
     <label class="chk">段间转场（秒，0=硬切）<input type="number" id="autoTransition" value="0.5" min="0" max="5" step="0.1" style="width:60px" /></label>
+    <label class="chk" title="把各段配音同名 .srt 字幕烧进画面（默认不烧，用剪映素材包导入更灵活）"><input type="checkbox" id="autoBurnSubs" /> 烧录字幕进画面</label>
     <input type="text" id="autoOutDir" placeholder="成品目录（默认 E:/worddeepseek/videocut/product）" style="flex:1" />
     <input type="text" id="autoOutName" placeholder="成品名（留空自动）" style="flex:1" />
   </div>
@@ -3328,6 +3384,7 @@ autoGenBtn.addEventListener('click', function(){
     games: games,
     padding: Number(autoPaddingInput.value) || 2,
     transition: Number(document.getElementById('autoTransition').value) || 0,
+    burnSubs: !!(document.getElementById('autoBurnSubs') && document.getElementById('autoBurnSubs').checked),
     outDir: autoOutDirInput.value.trim(),
     outName: autoOutNameInput.value.trim()
   };
