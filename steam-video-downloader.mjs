@@ -1008,8 +1008,8 @@ async function composeVideos(materials, outDir, outName) {
 
 // ── 配音上传（真人配音，01/02/03… 前缀，顺序 = 素材段顺序）────────────────────
 
-// GET /api/voice/list?dir=... ：列出配音目录音频，按文件名自然排序。
-function handleVoiceList(urlObj, res) {
+// GET /api/voice/list?dir=... ：列出配音目录音频，按文件名自然排序（含时长，供成片配队展示）。
+async function handleVoiceList(urlObj, res) {
   const dir = urlObj.searchParams.get('dir') || DEFAULT_VOICE_DIR;
   let files = [];
   try {
@@ -1017,13 +1017,27 @@ function handleVoiceList(urlObj, res) {
       .filter((f) => VOICE_EXTS.test(f))
       .map((f) => {
         const st = fs.statSync(path.join(dir, f));
-        return { name: f, size: st.size, mtime: st.mtimeMs, path: path.join(dir, f) };
+        return { name: f, size: st.size, mtime: st.mtimeMs, path: path.join(dir, f), dur: null };
       })
       .sort((a, b) => naturalCompare(a.name, b.name));
   } catch {
     // 目录不存在或不可读时返回空列表
   }
+  // 并发探测时长（优先同名 .srt 时长，否则实测音频）；失败不影响列表
+  await probeDurations(files, (f) => voiceDurationOf(f.path));
   return json(res, 200, { dir, files });
+}
+
+// 并发给文件列表补时长字段（限 4 并发，逐文件失败置 null 不中断）。
+async function probeDurations(files, probeFn) {
+  let i = 0;
+  const worker = async () => {
+    while (i < files.length) {
+      const f = files[i++];
+      try { f.dur = await probeFn(f); } catch { f.dur = null; }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(4, Math.max(1, files.length)) }, () => worker()));
 }
 
 // POST /api/voice/upload?name=xx.mp3&dir=... ：上传单个音频（body 为文件二进制，流式落盘，同名覆盖）。
@@ -1590,6 +1604,37 @@ async function runFfDuration(file) {
   return Number(m[1]) * 3600 + Number(m[2]) * 60 + Number(m[3]);
 }
 
+// 探测视频分辨率（宽x高）。复用 -i 探测，解析 stderr 中 "..., WxH [SAR ...]"。
+async function probeVideoSize(file) {
+  const ff = resolveFfmpeg();
+  if (!ff) throw new Error('未找到 ffmpeg');
+  const errFile = path.join(SCRIPT_DIR, `.tmp_sz_${Date.now()}_${randomUUID().slice(0, 8)}.txt`);
+  try { fs.rmSync(errFile, { force: true }); } catch { /* ignore */ }
+  const errFd = fs.openSync(errFile, 'w');
+  await new Promise((resolve, reject) => {
+    let child;
+    try {
+      child = spawn(ff, ['-i', file], { stdio: ['ignore', 'ignore', errFd], windowsHide: true });
+    } catch (e) {
+      try { fs.closeSync(errFd); } catch { /* ignore */ }
+      return reject(e);
+    }
+    child.on('error', (e) => { try { fs.closeSync(errFd); } catch { /* ignore */ } reject(e); });
+    child.on('close', () => { try { fs.closeSync(errFd); } catch { /* ignore */ } resolve(); });
+  });
+  let text = '';
+  try { text = fs.readFileSync(errFile, 'utf8'); } catch { /* ignore */ }
+  try { fs.rmSync(errFile, { force: true }); } catch { /* ignore */ }
+  const m = /Video:.*?(\d{2,5})x(\d{2,5})/.exec(text) || /(\d{2,5})x(\d{2,5})/.exec(text);
+  if (!m) throw new Error(`无法读取视频分辨率：${file}`);
+  return { w: Number(m[1]), h: Number(m[2]) };
+}
+
+// 把不同分辨率的输入统一成标准尺寸（等比缩放 + 黑边补全，供 xfade/concat 链使用）。
+function scaleFilterTo(w, h) {
+  return `scale=${w}:${h}:force_original_aspect_ratio=decrease,pad=${w}:${h}:(ow-iw)/2:(oh-ih)/2,setsar=1`;
+}
+
 // 解析 srt 总时长（末条字幕结束时间，秒）。
 function parseSrtDuration(srtPath) {
   try {
@@ -1705,8 +1750,10 @@ async function handleComposeAuto(req, res) {
       const clips = segLens.map((_, i) => path.join(tmpDir, `clip${i + 1}.mp4`));
       const args = ['-y', '-loglevel', 'error'];
       clips.forEach((c) => args.push('-i', c));
+      // 各素材分辨率可能不同（不同游戏/竖屏），统一到第一个片段的尺寸再 xfade
+      const { w, h } = await probeVideoSize(clips[0]);
       const fc = [];
-      clips.forEach((_, i) => fc.push(`[${i}:v]fps=${fps},format=yuv420p[v${i}]`));
+      clips.forEach((_, i) => fc.push(`[${i}:v]fps=${fps},${scaleFilterTo(w, h)},format=yuv420p[v${i}]`));
       let prev = 'v0';
       for (let k = 1; k < n; k++) {
         const offset = accOf(k) - k * transition;
@@ -2151,26 +2198,32 @@ function freeRanges(dur, used) {
   return segs;
 }
 
-// 从素材选取未用片段用于混剪：贪心凑满 targetDur（同一未用区间可切多段）。
+// 从素材选取片段用于片头/片尾混剪：优先"未用"区间（不与正片画面重复）；
+// 若素材被正片（含循环补播）用尽，兜底从素材开头取——片尾回顾集锦本就该含正片画面。
 // clips: [{path, s, e}] 顺序即混剪顺序
 function pickFreeClips(materialsUsed, targetDur, clipLen) {
   const clips = [];
   let acc = 0;
+  const take = (m, s, e) => {
+    while (s < e - 0.5 && acc < targetDur - 0.2) {
+      const avail = e - s;
+      let len = Math.min(clipLen, avail);
+      const need = targetDur - acc;
+      if (need > 0.5 && need < len) len = need;
+      if (len < 0.5) break;
+      clips.push({ path: m.path, s, e: s + len });
+      acc += len;
+      s += len;
+    }
+  };
   for (const m of materialsUsed) {
     if (acc >= targetDur - 0.2) break;
-    const fr = freeRanges(m.dur, m.used);
-    for (const f of fr) {
-      let pos = f.s;
-      while (pos < f.e - 0.5 && acc < targetDur - 0.2) {
-        const need = targetDur - acc;
-        const avail = f.e - pos;
-        let take = Math.min(clipLen, avail);
-        if (need > 0.5 && need < take) take = need; // 末段补精确到目标
-        if (take < 0.5) break;
-        clips.push({ path: m.path, s: pos, e: pos + take });
-        acc += take;
-        pos += take;
-      }
+    for (const f of freeRanges(m.dur, m.used)) take(m, f.s, f.e);
+  }
+  if (acc < targetDur - 0.2) {
+    for (const m of materialsUsed) {
+      if (acc >= targetDur - 0.2) break;
+      take(m, 0, m.dur);
     }
   }
   return { clips, acc };
@@ -2183,12 +2236,14 @@ async function renderMontage(clips, outPath) {
   const tmpDir = path.join(SCRIPT_DIR, `.tmp_mont_${Date.now()}_${randomUUID().slice(0, 8)}`);
   fs.mkdirSync(tmpDir, { recursive: true });
   try {
+    // 各素材分辨率可能不同（不同游戏/横竖屏），统一到第一片尺寸再拼接
+    const { w, h } = await probeVideoSize(clips[0].path);
     const ins = [];
     const fc = [];
     clips.forEach((c, i) => {
       const clip = path.join(tmpDir, `m${i}.mp4`);
       ins.push('-i', c.path);
-      fc.push(`[${i}:v]trim=start=${c.s}:end=${c.e},setpts=PTS-STARTPTS,fps=30,format=yuv420p[v${i}]`);
+      fc.push(`[${i}:v]trim=start=${c.s}:end=${c.e},setpts=PTS-STARTPTS,fps=30,${scaleFilterTo(w, h)},format=yuv420p[v${i}]`);
     });
     // 硬切串联（快剪感）：用 concat filter
     let prev = 'v0';
@@ -2205,6 +2260,28 @@ async function renderMontage(clips, outPath) {
 }
 
 // ── C2：完整时间线合成（片头混剪 + 正片 + 片尾混剪 + 片尾总表）───────────────
+
+// 剪辑一段画面：素材足够则流拷贝直剪（秒级）；不够且 loop=true 时用 -stream_loop 把
+// [start..素材末尾] 的画面循环补播直到覆盖 segLen（重编码，输出时长帧精确，每轮都从 start 起播）。
+// 返回素材总长与实际起点，供"未用片段"混剪取材统计。
+async function clipSegment(ff, mat, start, segLen, loop, seq, outPath) {
+  const matDur = await runFfDuration(mat);
+  if (start >= matDur - 0.2) {
+    throw new Error(`段 ${seq}：起点 ${start.toFixed(1)}s 已超出素材总长 ${matDur.toFixed(1)}s`);
+  }
+  if (start + segLen <= matDur + 0.5) {
+    await runLocal(ff, ['-y', '-loglevel', 'error', '-ss', String(start), '-i', mat, '-t', String(segLen), '-an', '-c:v', 'copy', '-avoid_negative_ts', 'make_zero', outPath], { timeoutMs: 120000 });
+    return { matDur, from: start, looped: false };
+  }
+  if (!loop) {
+    throw new Error(`段 ${seq}：素材不够剪——需从 ${start.toFixed(1)}s 剪 ${segLen.toFixed(1)}s，素材总长仅 ${matDur.toFixed(1)}s；请勾选该段"不足循环补播"以自动重复画面，或换更长的素材`);
+  }
+  // 循环起点：优先 [start..末尾]；起点距素材末尾不足 0.5s 时退回从 0 循环整段
+  const from = matDur - start < 0.5 ? 0 : start;
+  await runLocal(ff, ['-y', '-loglevel', 'error', '-stream_loop', '-1', '-i', mat, '-ss', String(from), '-t', String(segLen), '-an', '-c:v', 'libx264', '-crf', '18', '-preset', 'fast', '-pix_fmt', 'yuv420p', outPath], { timeoutMs: 600000 });
+  return { matDur, from, looped: true };
+}
+
 // body: {
 //   voices:    [开场白01, 解说1, 解说2...]   配音顺序（01=片头开场白）
 //   materials: [{path, start?} 解说1..k 的素材段]  （数量 = 解说数）
@@ -2221,11 +2298,20 @@ async function handleComposeTimeline(req, res) {
   const voices = Array.isArray(payload.voices) ? payload.voices : [];
   const materials = Array.isArray(payload.materials) ? payload.materials : [];
   const games = Array.isArray(payload.games) ? payload.games : [];
-  if (!voices.length) return json(res, 400, { error: '请至少选择一段配音（01 为片头开场白）' });
+  if (!voices.length) return json(res, 400, { error: '请至少选择一段配音（第 1 段可标记为片头开场白）' });
   if (!materials.length) return json(res, 400, { error: '请选择正片素材' });
 
-  // 配音 01 = 开场白（当 voices 比 materials 多一个时）
-  const hasHead = voices.length === materials.length + 1;
+  // 片头判定：优先显式 isHead（须在第 1 段，与素材数量无关，保证用户拖动排序的自由）；
+  // 无显式标记时沿用旧规则——配音比素材多 1 段即视为片头开场白。
+  let hasHead = false;
+  if (voices.some((v) => v && v.isHead)) {
+    if (!(voices[0] && voices[0].isHead)) {
+      return json(res, 400, { error: '标记为开场白的配音须在第 1 段（请把该段拖到开头，或取消片头勾选让它按普通段配素材）' });
+    }
+    hasHead = true;
+  } else if (voices.length === materials.length + 1) {
+    hasHead = true;
+  }
   const segVoices = hasHead ? voices.slice(1) : voices;
   if (segVoices.length !== materials.length) {
     return json(res, 400, { error: `配音(${voices.length}) 需比素材(${materials.length})多一段开场白，或两者数量一致` });
@@ -2260,15 +2346,16 @@ async function handleComposeTimeline(req, res) {
       if (!fs.existsSync(mat)) throw new Error(`素材不存在：${mat}`);
       if (!fs.existsSync(voice)) throw new Error(`配音不存在：${voice}`);
       const start = Math.max(0, Number(materials[i].start) || 0);
+      const loop = materials[i].loop !== false; // 默认开启：素材不够剪时循环补播直到覆盖配音
       const tVoice = await voiceDurationOf(voice);
       const segLen = tVoice + padding;
-      const matDur = await runFfDuration(mat);
-      if (start + segLen > matDur + 0.5) throw new Error(`素材 ${i + 1} 不够剪`);
       const clip = path.join(tmpDir, `seg${i}.mp4`);
-      await runLocal(ff, ['-y', '-loglevel', 'error', '-ss', String(start), '-i', mat, '-t', String(segLen), '-an', '-c:v', 'copy', '-avoid_negative_ts', 'make_zero', clip], { timeoutMs: 120000 });
+      const cutInfo = await clipSegment(ff, mat, start, segLen, loop, i + 1, clip);
       segFiles.push(clip);
       segDurs.push(segLen);
-      materialsUsed.push({ path: mat, dur: matDur, used: [{ s: start, e: start + segLen }] });
+      // 已用区间：循环段视为从起点用到结尾；普通段只占 [start, start+segLen]，其余留作混剪素材
+      const usedEnd = cutInfo.looped ? cutInfo.matDur : Math.min(cutInfo.matDur, cutInfo.from + segLen);
+      materialsUsed.push({ path: mat, dur: cutInfo.matDur, used: [{ s: cutInfo.from, e: usedEnd }] });
     }
 
     // 2) 计划段序列（时长）
@@ -2308,12 +2395,15 @@ async function handleComposeTimeline(req, res) {
       fileList.push(f);
     }
 
-    // 4) 画面合成：统一 fps -> xfade（转场）或 concat（硬切）
+    // 4) 画面合成：统一尺寸+帧率 -> xfade（转场）或 concat（硬切）
     const video = path.join(tmpDir, 'video.mp4');
     const ins = ['-y', '-loglevel', 'error'];
     fileList.forEach((f) => ins.push('-i', f));
+    // 片头/片尾混剪、总表与正片素材分辨率可能不同，统一到第一个画面（片头混剪或 seg0）的尺寸
+    const firstVid = fileList[0];
+    const { w: baseW, h: baseH } = await probeVideoSize(firstVid);
     const fc = [];
-    fileList.forEach((_, i) => fc.push(`[${i}:v]fps=${fps},format=yuv420p[v${i}]`));
+    fileList.forEach((_, i) => fc.push(`[${i}:v]fps=${fps},${scaleFilterTo(baseW, baseH)},format=yuv420p[v${i}]`));
     if (transition > 0 && nSeg > 1) {
       const accOf = (p) => durs.slice(0, p).reduce((a, b) => a + b, 0);
       let prev = 'v0';
@@ -2528,13 +2618,14 @@ async function handleComposeTimeline(req, res) {
   }
 }
 
-// GET /api/materials?dir=... ：列出素材目录的 mp4（附带解析出的游戏名）。
-function handleMaterials(urlObj, res) {
+// GET /api/materials?dir=... ：列出素材目录的视频（附带解析出的游戏名与时长，供成片配队判断够不够剪）。
+async function handleMaterials(urlObj, res) {
   const dir = urlObj.searchParams.get('dir') || DEFAULT_DIR;
   const files = listFiles(dir).filter((f) => /\.(mp4|webm|mkv|mov)$/i.test(f.name)).map((f) => ({
     ...f,
     gameName: parseGameNameFromFile(f.name),
   }));
+  await probeDurations(files, (f) => runFfDuration(f.path));
   return json(res, 200, { dir, files });
 }
 
@@ -2748,10 +2839,11 @@ https://store.steampowered.com/app/648800/Raft/"></textarea>
 <div class="card">
   <h2>⏱️ 自动贴合成片（完整时间线）</h2>
   <div class="sub" style="margin:0 0 8px">
-    素材与解说配音<strong>按顺序一一对应</strong>（素材1↔配音2↔游戏数据行1）。
-    每段画面时长 = 配音时长（优先同名 .srt，否则实测音频）+ <strong>余量</strong>秒；
-    段间按<strong>转场</strong>秒数淡入淡出。若<strong>配音比素材多 1 段</strong>（<code>01_开场白.mp3</code>），
-    将自动生成：<strong>片头素材混剪（配 01 开场白）→ 正片 → 片尾素材混剪 → 片尾省流总表</strong>（总表用游戏数据区结果，自动渲染）。
+    载入配音后，<strong>每一行 = 一段配音</strong>，顺序即成片播放顺序（<strong>按住行拖动</strong>或 ↑↓ 调整）。
+    每段在「画面素材」下拉里<strong>自由连线</strong>你想配的视频素材（同一素材可重复配给多段）。
+    第 1 段勾选<strong>片头开场（混剪）</strong>后，画面自动取各素材未用片段拼成片头，其后各段 = 配音时长 + 余量。
+    若所选素材<strong>不够剪</strong>（时长不足覆盖配音），勾选<strong>不足循环补播</strong>会自动重复该段画面直到够；
+    段间按<strong>转场</strong>秒数淡入淡出；末尾自动接片尾素材混剪 + 片尾省流总表（总表用游戏数据区结果）。
   </div>
   <div class="row">
     <input type="text" id="autoMatDir" placeholder="素材目录（默认下载素材目录）" />
@@ -3460,89 +3552,234 @@ var autoPairInfoEl = document.getElementById('autoPairInfo');
 var autoStatusEl = document.getElementById('autoStatus');
 var autoResultEl = document.getElementById('autoResult');
 var autoGenBtn = document.getElementById('autoGen');
-var autoMats = [];   // { path, name, start }
-var autoVoices = []; // { path, name }
+var autoMats = [];   // 素材池：{ path, name, dur }（dur=秒，来自 /api/materials）
+var autoVoices = []; // 时间轴行（数组顺序 = 播出顺序）：{ path, name, dur, isHead, matSel, start, loop }
 
 function aStatus(t) { autoStatusEl.textContent = t || ''; }
+function fmtDurSec(s) {
+  var n = Number(s);
+  if (s == null || isNaN(n)) return '—';
+  if (n < 60) return (Math.round(n * 10) / 10) + 's';
+  var m = Math.floor(n / 60), sec = Math.round(n % 60);
+  return m + ':' + (sec < 10 ? '0' : '') + sec;
+}
+// 配音名是否像开场白（01_xxx / 开场 / 片头 …）
+function looksLikeHead(name) {
+  return /^0*1[_\-. ]|^01|开场|片头|开场白|intro|opening|head/i.test(String(name || ''));
+}
 
 function loadAutoMats() {
   var dir = autoMatDirInput.value.trim() || '';
+  aStatus('载入素材并探测时长……');
   fetch('/api/materials?dir=' + encodeURIComponent(dir))
     .then(function(r){ return r.json(); })
     .then(function(res){
       if (res.error) { aStatus(res.error); return; }
       if (!autoMatDirInput.value.trim()) autoMatDirInput.value = res.dir;
-      autoMats = res.files.map(function(f){ return { path: f.path, name: f.gameName || f.name, start: '' }; });
-      renderAutoRows();
-      updateAutoPair();
-      aStatus('已载入 ' + autoMats.length + ' 个素材');
+      autoMats = res.files.map(function(f){ return { path: f.path, name: f.gameName || f.name, dur: f.dur }; });
+      syncAutoConfig();
+      aStatus('已载入 ' + autoMats.length + ' 个素材（含时长）');
     })
     .catch(function(e){ aStatus('载入失败：' + e.message); });
 }
 function loadAutoVoices() {
   var dir = autoVoiceDirInput.value.trim() || '';
+  aStatus('载入配音并探测时长……');
   fetch('/api/voice/list?dir=' + encodeURIComponent(dir))
     .then(function(r){ return r.json(); })
     .then(function(res){
       if (res.error) { aStatus(res.error); return; }
       if (!autoVoiceDirInput.value.trim()) autoVoiceDirInput.value = res.dir;
-      autoVoices = res.files.map(function(f){ return { path: f.path, name: f.name }; });
-      renderAutoRows();
-      updateAutoPair();
-      aStatus('已载入 ' + autoVoices.length + ' 段配音');
+      autoVoices = res.files.map(function(f){ return { path: f.path, name: f.name, dur: f.dur, isHead: false, matSel: -1, start: '0', loop: true }; });
+      syncAutoConfig();
+      aStatus('已载入 ' + autoVoices.length + ' 段配音（含时长）');
     })
     .catch(function(e){ aStatus('载入失败：' + e.message); });
 }
 document.getElementById('autoLoadMat').addEventListener('click', loadAutoMats);
 document.getElementById('autoLoadVoice').addEventListener('click', loadAutoVoices);
 
-function renderAutoRows() {
-  if (!autoMats.length && !autoVoices.length) {
-    autoRowsEl.innerHTML = '<div class="empty">先分别载入素材与配音（按顺序一一对应：素材1↔配音1）</div>';
-    return;
+// 载入后：推断片头（01 配音且比素材多 1）、为没配过素材的解说段补默认素材（第 j 段 → 素材 j）
+function syncAutoConfig() {
+  if (autoVoices.length && autoMats.length && !autoVoices[0].isHead
+      && autoVoices.length === autoMats.length + 1 && looksLikeHead(autoVoices[0].name)) {
+    autoVoices[0].isHead = true;
   }
-  var n = Math.max(autoMats.length, autoVoices.length);
-  var html = '';
-  for (var i = 0; i < n; i++) {
-    var m = autoMats[i];
-    var v = autoVoices[i];
-    html += '<div class="it"><div class="top" style="align-items:center">';
-    if (m) {
-      html += '<span style="flex:1"><b>#' + (i + 1) + ' 素材</b> ' + esc(m.name || m.path) + '</span>';
-      html += '<input type="text" data-ai="' + i + '" value="' + esc(m.start) + '" placeholder="起点(0)" title="素材起点(秒)" style="width:80px" />';
-    } else {
-      html += '<span style="flex:1;color:#b00020">#' + (i + 1) + ' 缺素材</span><span style="width:80px"></span>';
+  var j = 0;
+  autoVoices.forEach(function(v){
+    if (v.isHead) return;
+    if (v.matSel === undefined || v.matSel === null || v.matSel === -1) {
+      v.matSel = j < autoMats.length ? j : -1;
     }
-    html += '<span style="padding:0 6px">↔</span>';
-    if (v) html += '<span style="flex:1">🎙️ ' + esc(v.name) + '</span>';
-    else html += '<span style="flex:1;color:#b00020">缺配音</span>';
-    html += '</div></div>';
-  }
-  autoRowsEl.innerHTML = html;
-  autoRowsEl.querySelectorAll('input[data-ai]').forEach(function(inp){
-    inp.addEventListener('input', function(){
-      var idx = Number(inp.getAttribute('data-ai'));
-      if (autoMats[idx]) autoMats[idx].start = inp.value;
-    });
+    if (v.start === undefined) v.start = '0';
+    if (v.loop === undefined) v.loop = true;
+    j++;
   });
-}
-function updateAutoPair() {
-  if (!autoMats.length || !autoVoices.length) { autoPairInfoEl.textContent = ''; return; }
-  if (autoVoices.length === autoMats.length) autoPairInfoEl.textContent = '✅ 素材与配音数量一致（无片头）。每段画面 = 配音时长 + 余量。';
-  else if (autoVoices.length === autoMats.length + 1) autoPairInfoEl.textContent = '✅ 配音比素材多 1（第 1 个 = 片头开场白）→ 将自动生成：片头混剪 + 正片 + 片尾混剪 + 片尾省流总表';
-  else autoPairInfoEl.textContent = '⚠️ 配音数需等于素材数，或比素材多 1（含片头开场白）。顺序即配对，请调整。';
+  renderAutoRows();
+  updateAutoPair();
 }
 
-autoGenBtn.addEventListener('click', function(){
-  if (!autoMats.length || !autoVoices.length) { aStatus('请先载入素材与配音'); return; }
-  var okCnt = (autoVoices.length === autoMats.length) || (autoVoices.length === autoMats.length + 1);
-  if (!okCnt) { aStatus('配音数需等于素材数，或比素材多 1（01=片头开场白）'); return; }
-  // 自动携带游戏数据（Excel / Steam 抓取结果）用于片尾总表
+// 排序（拖动落点/↑↓按钮）：交换两行；同步 Excel/Steam 游戏数据行序，保证总表卡片跟行走。
+function moveAutoVoice(i, j) {
+  if (i === j || i < 0 || j < 0 || i >= autoVoices.length || j >= autoVoices.length) return;
+  if (autoVoices[i].isHead && j !== 0) { aStatus('片头段固定在第 1 位：请先取消「片头开场」勾选再移动'); return; }
+  var t = autoVoices[i]; autoVoices[i] = autoVoices[j]; autoVoices[j] = t;
+  if (autoVoices[0] && autoVoices[0].isHead && j === 0 && i !== 0) {
+    autoVoices[0].isHead = false;
+    aStatus('片头已取消：第 1 段现按普通段处理，请为它选素材');
+  }
   var gd = window.__excelData;
-  var games = (gd && gd.rows && gd.rows.length) ? gd.rows.map(function(r){ return { name: r.name, price: r.price, now: r.now, rating: r.rating, discount: r.discount, deadline: r.deadline, keyPrice: r.keyPrice || '', tag1: r.tag1, tag2: r.tag2 }; }) : [];
+  if (gd && gd.rows && i < gd.rows.length && j < gd.rows.length) {
+    var a = gd.rows[i], b = gd.rows[j];
+    if (a && b) { gd.rows[i] = b; gd.rows[j] = a; }
+  }
+  renderAutoRows();
+  updateAutoPair();
+}
+
+function renderAutoRows() {
+  if (!autoVoices.length) {
+    autoRowsEl.innerHTML = '<div class="empty">先点「🎙️ 载入配音」（或在上方配音面板上传后刷新）。每一行 = 一段配音（顺序即成片顺序，可拖动/↑↓调整）；每段可为它挑选画面素材（连线配队）。</div>';
+    return;
+  }
+  var pad = Number(autoPaddingInput.value); if (isNaN(pad)) pad = 2;
+  var html = '';
+  for (var i = 0; i < autoVoices.length; i++) {
+    var v = autoVoices[i];
+    var head = !!v.isHead;
+    html += '<div class="it" data-vi="' + i + '"' + (head ? '' : ' draggable="true"') + '>';
+    html += '<div class="top" style="align-items:center">';
+    html += '<span' + (head ? '' : ' style="cursor:grab;color:#888" title="按住行拖动排序")' : '') + '>⠿</span>';
+    html += '<span style="flex:1"><b>#' + (i + 1) + '</b>　🎙️ ' + esc(v.name) + '　<span style="color:#888;font-size:12px">(' + fmtDurSec(v.dur) + ')</span></span>';
+    if (i === 0) {
+      html += '<label class="chk" title="开场白：画面自动截取各素材未用片段拼成片头混剪；取消勾选则本段改为自己选素材播放"><input type="checkbox" data-field="isHead"' + (head ? ' checked' : '') + ' /> 片头开场（混剪）</label>';
+    } else if (v.isHead) {
+      html += '<span style="color:#b06000;font-size:12px">片头段须在第 1 位</span>';
+    }
+    html += '<button class="ghost" style="padding:3px 9px" onclick="moveAutoVoice(' + i + ',' + (i - 1) + ')">↑</button>';
+    html += '<button class="ghost" style="padding:3px 9px" onclick="moveAutoVoice(' + i + ',' + (i + 1) + ')">↓</button>';
+    html += '</div>';
+    if (head) {
+      html += '<div class="meta" style="margin:6px 0 0 26px">🖼️ 画面 = <b>片头混剪</b>：自动截取各素材未用片段拼成，配本段配音（' + fmtDurSec(v.dur) + '）</div>';
+    } else {
+      var opts = '<option value="-1">— 请选择素材（连线本段画面）—</option>';
+      autoMats.forEach(function(m, mi) {
+        var extra = m.dur != null ? '（' + fmtDurSec(m.dur) + '）' : '';
+        opts += '<option value="' + mi + '"' + (v.matSel === mi ? ' selected' : '') + '>' + esc(m.name || m.path) + ' ' + extra + '</option>';
+      });
+      var matSel = (v.matSel >= 0 && v.matSel < autoMats.length) ? autoMats[v.matSel] : null;
+      var tip = '';
+      if (matSel && matSel.dur != null) {
+        var need = (v.dur || 0) + pad;
+        var avail = matSel.dur - (Number(v.start) || 0);
+        if (avail + 0.5 >= need) tip = '<span style="color:#1a7a3a;font-size:12px">素材足够</span>';
+        else if (v.loop) tip = '<span style="color:#b06000;font-size:12px">⚠ 不足 → 将循环补播覆盖</span>';
+        else tip = '<span style="color:#b00020;font-size:12px">⚠ 素材不够且未开循环</span>';
+      }
+      html += '<div class="row" style="margin:8px 0 0 26px">';
+      html += '<span style="font-size:13px;color:#888;white-space:nowrap">画面素材</span>';
+      html += '<select data-field="matSel" style="min-width:200px;flex:1">' + opts + '</select>';
+      html += '<label class="chk">起点<input type="text" data-field="start" value="' + esc(String(v.start)) + '" style="width:56px;min-width:0;padding:6px 8px" title="素材剪辑起点（秒，0 = 从头）" /></label>';
+      html += '<label class="chk" title="素材长度不够覆盖本段配音时，重复该段画面直到够（loop）"><input type="checkbox" data-field="loop"' + (v.loop ? ' checked' : '') + ' /> 不足循环补播</label>';
+      if (tip) html += tip;
+      html += '</div>';
+    }
+    html += '</div>';
+  }
+  autoRowsEl.innerHTML = html;
+}
+function updateAutoPair() {
+  if (!autoVoices.length) { autoPairInfoEl.textContent = ''; return; }
+  var head = !!(autoVoices[0] && autoVoices[0].isHead);
+  var segs = autoVoices.filter(function(x){ return !x.isHead; });
+  var unpaired = segs.filter(function(x){ return x.matSel < 0; });
+  var msg = head
+    ? '第 1 段 = 片头开场白（画面自动混剪）；其后 ' + segs.length + ' 段为正片（顺序即播放顺序）'
+    : '共 ' + autoVoices.length + ' 段配音按普通段顺序播放（无片头混剪）';
+  if (unpaired.length) msg += '；⚠️ ' + unpaired.length + ' 段还没选画面素材';
+  else if (segs.length) msg += '；✅ 每段都已配素材';
+  autoPairInfoEl.textContent = msg;
+}
+
+// 行内控件事件（委托）：下拉选素材=连线、起点、循环开关、片头勾选
+autoRowsEl.addEventListener('input', function(ev){
+  var el = ev.target;
+  if (!el || !el.dataset || !el.dataset.field) return;
+  var rowEl = el.closest('[data-vi]');
+  var v = rowEl ? autoVoices[Number(rowEl.dataset.vi)] : null;
+  if (!v) return;
+  if (el.dataset.field === 'start') v.start = el.value;
+});
+autoRowsEl.addEventListener('change', function(ev){
+  var el = ev.target;
+  if (!el || !el.dataset || !el.dataset.field) return;
+  var rowEl = el.closest('[data-vi]');
+  if (!rowEl) return;
+  var vi = Number(rowEl.dataset.vi);
+  var v = autoVoices[vi];
+  if (!v) return;
+  var f = el.dataset.field;
+  if (f === 'matSel') {
+    v.matSel = Number(el.value);
+    if (v.matSel >= 0 && String(v.start) === '0') v.start = '0';
+    aStatus('已连线：#' + (vi + 1) + ' 配音 → ' + (v.matSel >= 0 ? (autoMats[v.matSel] ? autoMats[v.matSel].name : '素材') : '未选'));
+  } else if (f === 'loop') {
+    v.loop = el.checked;
+  } else if (f === 'isHead') {
+    v.isHead = el.checked;
+    if (v.isHead && vi !== 0) { v.isHead = false; aStatus('片头开场只允许设给第 1 段'); }
+    else if (v.isHead) { v.matSel = -1; aStatus('第 1 段已设为片头：画面自动取未用片段混剪'); }
+  }
+  renderAutoRows();
+  updateAutoPair();
+});
+// 行拖动排序
+var autoDragVi = -1;
+autoRowsEl.addEventListener('dragstart', function(ev){
+  var rowEl = ev.target.closest('[data-vi]');
+  if (!rowEl || !rowEl.draggable) { ev.preventDefault(); return; }
+  autoDragVi = Number(rowEl.dataset.vi);
+  try { ev.dataTransfer.effectAllowed = 'move'; } catch { /* ignore */ }
+  rowEl.style.opacity = '0.45';
+});
+autoRowsEl.addEventListener('dragend', function(){
+  autoDragVi = -1;
+  autoRowsEl.querySelectorAll('.it').forEach(function(r){ r.style.opacity = ''; });
+});
+autoRowsEl.addEventListener('dragover', function(ev){ ev.preventDefault(); });
+autoRowsEl.addEventListener('drop', function(ev){
+  ev.preventDefault();
+  var rowEl = ev.target.closest('[data-vi]');
+  if (rowEl && autoDragVi >= 0) moveAutoVoice(autoDragVi, Number(rowEl.dataset.vi));
+  autoDragVi = -1;
+});
+
+autoGenBtn.addEventListener('click', function(){
+  if (!autoVoices.length) { aStatus('请先载入配音'); return; }
+  var head = !!(autoVoices[0] && autoVoices[0].isHead);
+  var segs = autoVoices.filter(function(v){ return !v.isHead; });
+  var unpaired = segs.filter(function(v){ return v.matSel < 0; });
+  if (unpaired.length) { aStatus('还有 ' + unpaired.length + ' 段没选画面素材（显示"— 请选择素材—"）：请为每段配音连线素材'); return; }
+  if (!segs.length) { aStatus('没有普通段（只有片头）：请至少为一段配音选择素材'); return; }
+  var voices = autoVoices.map(function(v){ return { path: v.path, isHead: !!v.isHead }; });
+  var materials = segs.map(function(v){
+    var m = autoMats[v.matSel];
+    return { path: m.path, start: Number(v.start) || 0, loop: v.loop !== false };
+  });
+  // 游戏数据（Excel / Steam）用于片尾总表与自动卡片：行序已随拖动同步
+  var gd = window.__excelData;
+  var games = [];
+  var warnTxt = '';
+  if (gd && gd.rows && gd.rows.length) {
+    if (gd.rows.length === materials.length) {
+      games = gd.rows.map(function(r){ return { name: r.name, price: r.price, now: r.now, rating: r.rating, discount: r.discount, deadline: r.deadline, keyPrice: r.keyPrice || '', tag1: r.tag1, tag2: r.tag2 }; });
+    } else {
+      warnTxt = '（游戏数据 ' + gd.rows.length + ' 行 ≠ 素材段 ' + materials.length + ' 段，本次不渲染总表/卡片）';
+    }
+  }
   var payload = {
-    materials: autoMats.map(function(m){ return { path: m.path, start: m.start || 0 }; }),
-    voices: autoVoices.map(function(v){ return { path: v.path }; }),
+    materials: materials,
+    voices: voices,
     games: games,
     padding: Number(autoPaddingInput.value) || 2,
     transition: Number(document.getElementById('autoTransition').value) || 0,
@@ -3551,7 +3788,7 @@ autoGenBtn.addEventListener('click', function(){
     outName: autoOutNameInput.value.trim()
   };
   autoGenBtn.disabled = true;
-  aStatus('合成完整成片（片头混剪 → 正片 → 片尾混剪 → 省流总表），请稍候（转场+总表渲染较耗时）……');
+  aStatus('合成完整成片（片头混剪 → 正片 → 片尾混剪 → 省流总表），请稍候（转场+总表渲染较耗时）……' + warnTxt);
   autoResultEl.innerHTML = '';
   fetch('/api/compose-timeline', {
     method: 'POST',
@@ -4038,9 +4275,9 @@ function main() {
     } else if (p === '/api/files') {
       handleFiles(urlObj, res);
     } else if (p === '/api/materials') {
-      handleMaterials(urlObj, res);
+      handleMaterials(urlObj, res).catch((e) => json(res, 500, { error: e.message }));
     } else if (p === '/api/voice/list') {
-      handleVoiceList(urlObj, res);
+      handleVoiceList(urlObj, res).catch((e) => json(res, 500, { error: e.message }));
     } else if (p === '/api/voice/upload') {
       handleVoiceUpload(req, res, urlObj);
     } else if (p === '/api/voice/delete') {
