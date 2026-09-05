@@ -819,7 +819,7 @@ async function runJob(job) {
           return;
         } else {
           // HLS：Node 下载分片 -> 本地清单 -> 内置 ffmpeg 合并（无需外部解析器）。
-          const tmpDir = path.join(job.dir, `_hls_${it.appid}_${Date.now()}`);
+          const tmpDir = path.join(SCRIPT_DIR, `.tmp_hls_${it.appid}_${Date.now()}_${randomUUID().slice(0, 6)}`);
           const masterLocal = path.join(tmpDir, 'master.m3u8');
           try {
             await downloadHlsToLocal(it.videoUrl, job.quality, tmpDir, (done, total, bytes, secs) => {
@@ -971,8 +971,8 @@ async function composeVideos(materials, outDir, outName) {
     : `${dateStr}_${list.map((x) => sanitizeName(x.name)).join('_')}`;
   const dest = uniquePath(path.join(outDir, `${sanitizeName(baseName)}.mp4`));
 
-  // 临时目录：与成品同盘（避免跨盘 rename），隐藏目录，结束后删除
-  const tmpDir = path.join(outDir, `.compose_tmp_${Date.now()}`);
+  // 临时目录：放工具目录（已 .gitignore），结束后删除；产物写 outDir
+  const tmpDir = path.join(SCRIPT_DIR, `.tmp_compose_${Date.now()}_${randomUUID().slice(0, 8)}`);
   fs.mkdirSync(tmpDir, { recursive: true });
 
   const normClips = [];
@@ -1164,7 +1164,7 @@ function toSrtTime(sec) {
 async function runWhisperAsr(wavPath) {
   const so = resolveSherpaOnnx();
   if (!so.available) throw new Error('未找到 sherpa-onnx 语音识别引擎（需项目内 sherpa-onnx/models/whisper-small-int8）');
-  const outFile = `${wavPath}.asr.json`;
+  const outFile = path.join(SCRIPT_DIR, `.tmp_asr_${Date.now()}_${randomUUID().slice(0, 8)}.json`);
   try { fs.rmSync(outFile, { force: true }); } catch { /* ignore */ }
   const outFd = fs.openSync(outFile, 'w');
   await new Promise((resolve, reject) => {
@@ -1280,7 +1280,7 @@ async function handleSubtitleGenerate(req, res) {
     return json(res, 400, { error: `无法创建字幕输出目录：${e.message}` });
   }
 
-  const tmpDir = path.join(dir, `.subtitle_tmp_${Date.now()}`);
+  const tmpDir = path.join(SCRIPT_DIR, `.tmp_sub_${Date.now()}_${randomUUID().slice(0, 8)}`);
   fs.mkdirSync(tmpDir, { recursive: true });
   try {
     // 1) 转 16k 单声道 wav（sherpa-onnx 输入）
@@ -1497,6 +1497,165 @@ function handleExcelPreview(urlObj, res) {
   }
 }
 
+// ── A4 自动贴合：画面按配音时长 + 余量剪切拼接，配音按段贴入 ──────────────────
+
+// 用 ffmpeg 读取媒体时长（秒）。stderr 重定向到文件后解析 Duration 行。
+async function runFfDuration(file) {
+  const ff = resolveFfmpeg();
+  if (!ff) throw new Error('未找到 ffmpeg');
+  const errFile = path.join(SCRIPT_DIR, `.tmp_dur_${Date.now()}_${randomUUID().slice(0, 8)}.txt`);
+  try { fs.rmSync(errFile, { force: true }); } catch { /* ignore */ }
+  const errFd = fs.openSync(errFile, 'w');
+  await new Promise((resolve, reject) => {
+    let child;
+    try {
+      // 仅 -i（不加 -f null -），ffmpeg 打开输入即打印 Duration 后退出，毫秒级且不整段解码
+      child = spawn(ff, ['-i', file], { stdio: ['ignore', 'ignore', errFd], windowsHide: true });
+    } catch (e) {
+      try { fs.closeSync(errFd); } catch { /* ignore */ }
+      return reject(e);
+    }
+    const timer = setTimeout(() => { try { child.kill('SIGKILL'); } catch { /* ignore */ } }, 120000);
+    child.on('error', (e) => { clearTimeout(timer); try { fs.closeSync(errFd); } catch { /* ignore */ } reject(e); });
+    child.on('close', () => {
+      clearTimeout(timer);
+      try { fs.closeSync(errFd); } catch { /* ignore */ }
+      resolve();
+    });
+  });
+  let text = '';
+  try { text = fs.readFileSync(errFile, 'utf8'); } catch { /* ignore */ }
+  try { fs.rmSync(errFile, { force: true }); } catch { /* ignore */ }
+  const m = /Duration:\s*(\d+):(\d+):([\d.]+)/.exec(text);
+  if (!m) throw new Error(`无法读取媒体时长：${file}`);
+  return Number(m[1]) * 3600 + Number(m[2]) * 60 + Number(m[3]);
+}
+
+// 解析 srt 总时长（末条字幕结束时间，秒）。
+function parseSrtDuration(srtPath) {
+  try {
+    const text = fs.readFileSync(srtPath, 'utf8');
+    const re = /(\d{1,2}):(\d{2}):(\d{2}),(\d{3})\s*-->\s*(\d{1,2}):(\d{2}):(\d{2}),(\d{3})/g;
+    let m;
+    let last = 0;
+    while ((m = re.exec(text))) {
+      const end = Number(m[5]) * 3600 + Number(m[6]) * 60 + Number(m[7]) + Number(m[8]) / 1000;
+      if (end > last) last = end;
+    }
+    return last > 0 ? last : null;
+  } catch {
+    return null;
+  }
+}
+
+// 配音时长：优先同目录同名 .srt（用户 B1 产物），否则实测音频时长。
+async function voiceDurationOf(voicePath) {
+  const srt = voicePath.replace(/\.[^.]+$/, '') + '.srt';
+  const fromSrt = parseSrtDuration(srt);
+  if (fromSrt !== null) return fromSrt;
+  return runFfDuration(voicePath);
+}
+
+// POST /api/compose-auto ：素材↔配音按顺序配对自动成片。
+// body: {
+//   materials: [{ path, start? }]  素材顺序（start 默认 0）
+//   voices:    [{ path }]          配音顺序（与素材一一对应）
+//   padding: 2,                    每段画面比配音多出的余量秒数
+//   outDir, outName?
+// }
+async function handleComposeAuto(req, res) {
+  let payload;
+  try {
+    payload = JSON.parse(await readBody(req));
+  } catch {
+    return json(res, 400, { error: '请求体不是合法 JSON' });
+  }
+  const materials = Array.isArray(payload.materials) ? payload.materials : [];
+  const voices = Array.isArray(payload.voices) ? payload.voices : [];
+  if (!materials.length) return json(res, 400, { error: '请至少选择一个素材' });
+  if (!voices.length) return json(res, 400, { error: '请至少选择一段配音' });
+  if (materials.length !== voices.length) {
+    return json(res, 400, { error: `素材(${materials.length})与配音(${voices.length})数量不一致，需一一对应` });
+  }
+  const padding = Math.max(0, Number(payload.padding) || 2);
+  const outDir = String(payload.outDir || '').trim() || 'E:/worddeepseek/videocut/product';
+  const ff = resolveFfmpeg();
+  if (!ff) return json(res, 500, { error: '未找到 ffmpeg' });
+  try { fs.mkdirSync(outDir, { recursive: true }); } catch (e) { return json(res, 400, { error: `无法创建成品目录：${e.message}` }); }
+
+  const tmpDir = path.join(SCRIPT_DIR, `.tmp_auto_${Date.now()}_${randomUUID().slice(0, 8)}`);
+  fs.mkdirSync(tmpDir, { recursive: true });
+
+  const normClips = [];
+  const voiceDelays = []; // 毫秒（段起点累计）
+  let acc = 0;
+
+  try {
+    for (let i = 0; i < materials.length; i++) {
+      const mat = String(materials[i].path || '').trim();
+      const voice = String(voices[i].path || '').trim();
+      if (!fs.existsSync(mat)) throw new Error(`素材不存在：${mat}`);
+      if (!fs.existsSync(voice)) throw new Error(`配音不存在：${voice}`);
+      const start = Math.max(0, Number(materials[i].start) || 0);
+      // 配音时长 + 余量 = 画面段时长
+      const tVoice = await voiceDurationOf(voice);
+      const segLen = tVoice + padding;
+      // 校验素材够剪
+      const matDur = await runFfDuration(mat);
+      if (start + segLen > matDur + 0.5) {
+        throw new Error(`素材 ${i + 1}（${path.basename(mat)}）不够剪：需要从 ${start.toFixed(1)}s 剪 ${segLen.toFixed(1)}s，但素材总长仅 ${matDur.toFixed(1)}s`);
+      }
+      // 剪画面段（去原声，流拷贝）
+      const clip = path.join(tmpDir, `clip${i + 1}.mp4`);
+      await runLocal(ff, ['-y', '-loglevel', 'error', '-ss', String(start), '-i', mat, '-t', String(segLen), '-an', '-c:v', 'copy', '-avoid_negative_ts', 'make_zero', clip], { timeoutMs: 120000 });
+      const norm = path.join(tmpDir, `norm${i + 1}.mp4`);
+      await runLocal(ff, ['-y', '-loglevel', 'error', '-i', clip, '-c', 'copy', '-video_track_timescale', '15360', norm], { timeoutMs: 120000 });
+      normClips.push(norm);
+      voiceDelays.push({ voice, delayMs: Math.round(acc * 1000) });
+      acc += segLen;
+    }
+
+    // 拼接画面（无音轨）
+    const video = path.join(tmpDir, 'video.mp4');
+    const listFile = path.join(tmpDir, 'list.txt');
+    fs.writeFileSync(listFile, normClips.map((c) => `file ${escapeConcatPath(c)}`).join('\n'), 'utf8');
+    await runLocal(ff, ['-y', '-loglevel', 'error', '-f', 'concat', '-safe', '0', '-i', listFile, '-c', 'copy', video], { timeoutMs: 600000 });
+
+    // 合成音轨：静音底 + 各配音按延迟混入（amix normalize=0 保持音量）
+    const baseName = (payload.outName && String(payload.outName).trim())
+      ? String(payload.outName).trim()
+      : `${todayStr()}_自动贴合`;
+    const dest = uniquePath(path.join(outDir, `${sanitizeName(baseName)}.mp4`));
+
+    const args = ['-y', '-loglevel', 'error', '-i', video, '-f', 'lavfi', '-i', 'anullsrc=r=44100:cl=stereo'];
+    voiceDelays.forEach((v) => args.push('-i', v.voice));
+    const fc = [];
+    // 底轨
+    fc.push('[1:a]atrim=0:' + acc.toFixed(3) + ',asetpts=PTS-STARTPTS[base]');
+    voiceDelays.forEach((v, k) => {
+      const idx = 2 + k;
+      fc.push(`[${idx}:a]aformat=sample_rates=44100:channel_layouts=stereo,adelay=${v.delayMs}|${v.delayMs}[vo${k}]`);
+    });
+    const ins = ['[base]'].concat(voiceDelays.map((_, k) => `[vo${k}]`)).join('');
+    fc.push(`${ins}amix=inputs=${1 + voiceDelays.length}:duration=longest:normalize=0[aout]`);
+    args.push('-filter_complex', fc.join(';'), '-map', '0:v', '-map', '[aout]', '-c:v', 'copy', '-c:a', 'aac', '-b:a', '192k', dest);
+    await runLocal(ff, args, { timeoutMs: 600000 });
+    if (!fs.existsSync(dest)) throw new Error('合成失败（未生成文件）');
+    const st = fs.statSync(dest);
+    return json(res, 200, {
+      ok: true,
+      output: dest,
+      size: st.size,
+      duration: acc,
+      segments: voiceDelays.map((v, i) => ({ index: i + 1, delayMs: v.delayMs, segSeconds: acc ? null : null, voice: path.basename(v.voice) })),
+    });
+  } catch (e) {
+    return json(res, 502, { error: `自动成片失败：${e.message}` });
+  } finally {
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch { /* ignore */ }
+  }
+}
+
 // GET /api/materials?dir=... ：列出素材目录的 mp4（附带解析出的游戏名）。
 function handleMaterials(urlObj, res) {
   const dir = urlObj.searchParams.get('dir') || DEFAULT_DIR;
@@ -1698,6 +1857,32 @@ https://store.steampowered.com/app/648800/Raft/"></textarea>
   </div>
   <div id="excelInfo"></div>
   <div id="excelPreview"></div>
+</div>
+
+<div class="card">
+  <h2>⏱️ 自动贴合成片（按配音时长）</h2>
+  <div class="sub" style="margin:0 0 8px">
+    素材与配音<strong>按顺序一一对应</strong>（素材1↔配音1↔Excel行1）。每段画面时长 = 配音时长（优先同名 .srt，否则实测音频）+ <strong>余量</strong>秒；
+    画面自动剪切并去掉素材原声，配音按段落起点贴入音轨，最后拼接成片（本版硬切，转场下一版）。
+  </div>
+  <div class="row">
+    <input type="text" id="autoMatDir" placeholder="素材目录（默认下载素材目录）" />
+    <button id="autoLoadMat" class="ghost">📁 载入素材</button>
+    <input type="text" id="autoVoiceDir" placeholder="配音目录（默认配音目录）" style="flex:1" />
+    <button id="autoLoadVoice" class="ghost">🎙️ 载入配音</button>
+  </div>
+  <div id="autoPairInfo" class="warn"></div>
+  <div id="autoRows"></div>
+  <div class="row">
+    <label class="chk">画面余量（秒）<input type="number" id="autoPadding" value="2" min="0" max="30" style="width:60px" /></label>
+    <input type="text" id="autoOutDir" placeholder="成品目录（默认 E:/worddeepseek/videocut/product）" style="flex:1" />
+    <input type="text" id="autoOutName" placeholder="成品名（留空自动）" style="flex:1" />
+  </div>
+  <div class="row">
+    <button id="autoGen" class="accent">▶ 生成贴合成片</button>
+    <span id="autoStatus"></span>
+  </div>
+  <div id="autoResult"></div>
 </div>
 
 <div class="card">
@@ -2197,6 +2382,121 @@ voiceDirInput.parentElement.parentElement.addEventListener('drop', function(e){
 voiceDirInput.addEventListener('change', loadVoiceFiles);
 loadVoiceFiles();
 
+// ===== 自动贴合成片（A4） =====
+var autoMatDirInput = document.getElementById('autoMatDir');
+var autoVoiceDirInput = document.getElementById('autoVoiceDir');
+var autoPaddingInput = document.getElementById('autoPadding');
+var autoOutDirInput = document.getElementById('autoOutDir');
+var autoOutNameInput = document.getElementById('autoOutName');
+var autoRowsEl = document.getElementById('autoRows');
+var autoPairInfoEl = document.getElementById('autoPairInfo');
+var autoStatusEl = document.getElementById('autoStatus');
+var autoResultEl = document.getElementById('autoResult');
+var autoGenBtn = document.getElementById('autoGen');
+var autoMats = [];   // { path, name, start }
+var autoVoices = []; // { path, name }
+
+function aStatus(t) { autoStatusEl.textContent = t || ''; }
+
+function loadAutoMats() {
+  var dir = autoMatDirInput.value.trim() || '';
+  fetch('/api/materials?dir=' + encodeURIComponent(dir))
+    .then(function(r){ return r.json(); })
+    .then(function(res){
+      if (res.error) { aStatus(res.error); return; }
+      if (!autoMatDirInput.value.trim()) autoMatDirInput.value = res.dir;
+      autoMats = res.files.map(function(f){ return { path: f.path, name: f.gameName || f.name, start: '' }; });
+      renderAutoRows();
+      updateAutoPair();
+      aStatus('已载入 ' + autoMats.length + ' 个素材');
+    })
+    .catch(function(e){ aStatus('载入失败：' + e.message); });
+}
+function loadAutoVoices() {
+  var dir = autoVoiceDirInput.value.trim() || '';
+  fetch('/api/voice/list?dir=' + encodeURIComponent(dir))
+    .then(function(r){ return r.json(); })
+    .then(function(res){
+      if (res.error) { aStatus(res.error); return; }
+      if (!autoVoiceDirInput.value.trim()) autoVoiceDirInput.value = res.dir;
+      autoVoices = res.files.map(function(f){ return { path: f.path, name: f.name }; });
+      renderAutoRows();
+      updateAutoPair();
+      aStatus('已载入 ' + autoVoices.length + ' 段配音');
+    })
+    .catch(function(e){ aStatus('载入失败：' + e.message); });
+}
+document.getElementById('autoLoadMat').addEventListener('click', loadAutoMats);
+document.getElementById('autoLoadVoice').addEventListener('click', loadAutoVoices);
+
+function renderAutoRows() {
+  if (!autoMats.length && !autoVoices.length) {
+    autoRowsEl.innerHTML = '<div class="empty">先分别载入素材与配音（按顺序一一对应：素材1↔配音1）</div>';
+    return;
+  }
+  var n = Math.max(autoMats.length, autoVoices.length);
+  var html = '';
+  for (var i = 0; i < n; i++) {
+    var m = autoMats[i];
+    var v = autoVoices[i];
+    html += '<div class="it"><div class="top" style="align-items:center">';
+    if (m) {
+      html += '<span style="flex:1"><b>#' + (i + 1) + ' 素材</b> ' + esc(m.name || m.path) + '</span>';
+      html += '<input type="text" data-ai="' + i + '" value="' + esc(m.start) + '" placeholder="起点(0)" title="素材起点(秒)" style="width:80px" />';
+    } else {
+      html += '<span style="flex:1;color:#b00020">#' + (i + 1) + ' 缺素材</span><span style="width:80px"></span>';
+    }
+    html += '<span style="padding:0 6px">↔</span>';
+    if (v) html += '<span style="flex:1">🎙️ ' + esc(v.name) + '</span>';
+    else html += '<span style="flex:1;color:#b00020">缺配音</span>';
+    html += '</div></div>';
+  }
+  autoRowsEl.innerHTML = html;
+  autoRowsEl.querySelectorAll('input[data-ai]').forEach(function(inp){
+    inp.addEventListener('input', function(){
+      var idx = Number(inp.getAttribute('data-ai'));
+      if (autoMats[idx]) autoMats[idx].start = inp.value;
+    });
+  });
+}
+function updateAutoPair() {
+  if (!autoMats.length || !autoVoices.length) { autoPairInfoEl.textContent = ''; return; }
+  if (autoMats.length === autoVoices.length) autoPairInfoEl.textContent = '✅ 素材与配音数量一致（' + autoMats.length + ' 对），可生成。每段画面 = 配音时长 + 余量。';
+  else autoPairInfoEl.textContent = '⚠️ 素材(' + autoMats.length + ') 与配音(' + autoVoices.length + ') 数量不一致，顺序即配对，请调整。';
+}
+
+autoGenBtn.addEventListener('click', function(){
+  if (!autoMats.length || !autoVoices.length) { aStatus('请先载入素材与配音'); return; }
+  if (autoMats.length !== autoVoices.length) { aStatus('素材与配音数量不一致'); return; }
+  var payload = {
+    materials: autoMats.map(function(m){ return { path: m.path, start: m.start || 0 }; }),
+    voices: autoVoices.map(function(v){ return { path: v.path }; }),
+    padding: Number(autoPaddingInput.value) || 2,
+    outDir: autoOutDirInput.value.trim(),
+    outName: autoOutNameInput.value.trim()
+  };
+  autoGenBtn.disabled = true;
+  aStatus('处理中（读时长 → 剪切 → 拼接 → 贴音轨），配音较长请稍候……');
+  autoResultEl.innerHTML = '';
+  fetch('/api/compose-auto', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload)
+  })
+    .then(function(r){ return r.json(); })
+    .then(function(res){
+      autoGenBtn.disabled = false;
+      if (res.error) { aStatus('生成失败'); autoResultEl.innerHTML = '<div class="errmsg">' + esc(res.error) + '</div>'; return; }
+      aStatus('完成 ✓');
+      var html = '<div class="meta" style="color:#1a7a3a;margin-top:6px">✅ 成片已生成：<b>' + esc(res.output) + '</b>（' + formatSizeClient(res.size) + '，总时长约 ' + Math.round(res.duration) + ' 秒）</div>';
+      (res.segments || []).forEach(function(s){
+        html += '<div class="meta">段 ' + s.index + '：配音起点 ≈ ' + Math.round(s.delayMs / 1000) + 's（' + esc(s.voice) + '）</div>';
+      });
+      autoResultEl.innerHTML = html;
+    })
+    .catch(function(e){ autoGenBtn.disabled = false; aStatus('生成失败'); autoResultEl.innerHTML = '<div class="errmsg">请求失败：' + esc(e.message) + '</div>'; });
+});
+
 // ===== 剪辑拼接成片 =====
 var matDirInput = document.getElementById('matDir');
 var prodDirInput = document.getElementById('prodDir');
@@ -2558,6 +2858,8 @@ function main() {
       handleExcelUpload(req, res, urlObj);
     } else if (p === '/api/excel/preview') {
       handleExcelPreview(urlObj, res);
+    } else if (p === '/api/compose-auto' && req.method === 'POST') {
+      handleComposeAuto(req, res).catch((e) => json(res, 500, { error: e.message }));
     } else if (p === '/api/compose' && req.method === 'POST') {
       handleCompose(req, res).catch((e) => json(res, 500, { error: e.message }));
     } else if (p === '/api/open-folder') {
