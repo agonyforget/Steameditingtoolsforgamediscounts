@@ -2537,10 +2537,12 @@ https://store.steampowered.com/app/648800/Raft/"></textarea>
 </div>
 
 <div class="card">
-  <h2>⏱️ 自动贴合成片（按配音时长）</h2>
+  <h2>⏱️ 自动贴合成片（完整时间线）</h2>
   <div class="sub" style="margin:0 0 8px">
-    素材与配音<strong>按顺序一一对应</strong>（素材1↔配音1↔Excel行1）。每段画面时长 = 配音时长（优先同名 .srt，否则实测音频）+ <strong>余量</strong>秒；
-    画面自动剪切并去掉素材原声，段间按<strong>转场</strong>秒数淡入淡出（0=硬切），配音按段落起点贴入音轨，输出成片。
+    素材与解说配音<strong>按顺序一一对应</strong>（素材1↔配音2↔游戏数据行1）。
+    每段画面时长 = 配音时长（优先同名 .srt，否则实测音频）+ <strong>余量</strong>秒；
+    段间按<strong>转场</strong>秒数淡入淡出。若<strong>配音比素材多 1 段</strong>（<code>01_开场白.mp3</code>），
+    将自动生成：<strong>片头素材混剪（配 01 开场白）→ 正片 → 片尾素材混剪 → 片尾省流总表</strong>（总表用游戏数据区结果，自动渲染）。
   </div>
   <div class="row">
     <input type="text" id="autoMatDir" placeholder="素材目录（默认下载素材目录）" />
@@ -3232,25 +3234,31 @@ function renderAutoRows() {
 }
 function updateAutoPair() {
   if (!autoMats.length || !autoVoices.length) { autoPairInfoEl.textContent = ''; return; }
-  if (autoMats.length === autoVoices.length) autoPairInfoEl.textContent = '✅ 素材与配音数量一致（' + autoMats.length + ' 对），可生成。每段画面 = 配音时长 + 余量。';
-  else autoPairInfoEl.textContent = '⚠️ 素材(' + autoMats.length + ') 与配音(' + autoVoices.length + ') 数量不一致，顺序即配对，请调整。';
+  if (autoVoices.length === autoMats.length) autoPairInfoEl.textContent = '✅ 素材与配音数量一致（无片头）。每段画面 = 配音时长 + 余量。';
+  else if (autoVoices.length === autoMats.length + 1) autoPairInfoEl.textContent = '✅ 配音比素材多 1（第 1 个 = 片头开场白）→ 将自动生成：片头混剪 + 正片 + 片尾混剪 + 片尾省流总表';
+  else autoPairInfoEl.textContent = '⚠️ 配音数需等于素材数，或比素材多 1（含片头开场白）。顺序即配对，请调整。';
 }
 
 autoGenBtn.addEventListener('click', function(){
   if (!autoMats.length || !autoVoices.length) { aStatus('请先载入素材与配音'); return; }
-  if (autoMats.length !== autoVoices.length) { aStatus('素材与配音数量不一致'); return; }
+  var okCnt = (autoVoices.length === autoMats.length) || (autoVoices.length === autoMats.length + 1);
+  if (!okCnt) { aStatus('配音数需等于素材数，或比素材多 1（01=片头开场白）'); return; }
+  // 自动携带游戏数据（Excel / Steam 抓取结果）用于片尾总表
+  var gd = window.__excelData;
+  var games = (gd && gd.rows && gd.rows.length) ? gd.rows.map(function(r){ return { name: r.name, price: r.price, now: r.now, rating: r.rating, discount: r.discount, deadline: r.deadline, tag1: r.tag1, tag2: r.tag2 }; }) : [];
   var payload = {
     materials: autoMats.map(function(m){ return { path: m.path, start: m.start || 0 }; }),
     voices: autoVoices.map(function(v){ return { path: v.path }; }),
+    games: games,
     padding: Number(autoPaddingInput.value) || 2,
     transition: Number(document.getElementById('autoTransition').value) || 0,
     outDir: autoOutDirInput.value.trim(),
     outName: autoOutNameInput.value.trim()
   };
   autoGenBtn.disabled = true;
-  aStatus('处理中（读时长 → 剪切 → 拼接 → 贴音轨），配音较长请稍候……');
+  aStatus('合成完整成片（片头混剪 → 正片 → 片尾混剪 → 省流总表），请稍候（转场+总表渲染较耗时）……');
   autoResultEl.innerHTML = '';
-  fetch('/api/compose-auto', {
+  fetch('/api/compose-timeline', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload)
@@ -3261,9 +3269,9 @@ autoGenBtn.addEventListener('click', function(){
       if (res.error) { aStatus('生成失败'); autoResultEl.innerHTML = '<div class="errmsg">' + esc(res.error) + '</div>'; return; }
       aStatus('完成 ✓');
       window.__autoResult = res; // 供"游戏卡片叠加"联动
-      var html = '<div class="meta" style="color:#1a7a3a;margin-top:6px">✅ 成片已生成：<b>' + esc(res.output) + '</b>（' + formatSizeClient(res.size) + '，总时长约 ' + Math.round(res.duration) + ' 秒）</div>';
-      (res.segments || []).forEach(function(s){
-        html += '<div class="meta">段 ' + s.index + '：配音起点 ≈ ' + Math.round(s.delayMs / 1000) + 's（' + esc(s.voice) + '）</div>';
+      var html = '<div class="meta" style="color:#1a7a3a;margin-top:6px">✅ 完整成片已生成：<b>' + esc(res.output) + '</b>（' + formatSizeClient(res.size) + '，总时长约 ' + Math.round(res.duration) + ' 秒' + (games.length ? '，含省流总表 ' + games.length + ' 款游戏' : '') + '）</div>';
+      (res.windows || []).forEach(function(w){
+        html += '<div class="meta">' + esc(w.label) + '：' + Math.round(w.startMs / 1000) + 's → ' + Math.round(w.endMs / 1000) + 's</div>';
       });
       autoResultEl.innerHTML = html;
     })
@@ -3309,13 +3317,23 @@ document.getElementById('cardAutoTime').addEventListener('click', function(){
 });
 
 function autoTimeCards(ar) {
+  // 完整时间线结果：windows 带 label(游戏N/片头…) + startMs/endMs；旧接口：segments(delayMs)
+  var wins = ar.windows || [];
   var segs = ar.segments || [];
-  if (!segs.length) { cStatus2('成片结果缺少段落时间'); return; }
+  if (!wins.length && !segs.length) { cStatus2('成片结果缺少段落时间'); return; }
+  var gameWins = wins.filter(function(w){ return /游戏/.test(w.label || ''); });
   cardList.forEach(function(card, i) {
-    var s = segs[i];
-    if (!s) return;
-    var start = (s.delayMs || 0) / 1000;
-    var end = i + 1 < segs.length ? (segs[i + 1].delayMs || 0) / 1000 : (ar.duration || start + 5);
+    var w = gameWins[i];
+    var start = 0, end = 0;
+    if (w) {
+      start = (w.startMs || 0) / 1000;
+      end = (w.endMs || 0) / 1000;
+    } else if (segs[i]) {
+      start = (segs[i].delayMs || 0) / 1000;
+      end = i + 1 < segs.length ? (segs[i + 1].delayMs || 0) / 1000 : (ar.duration || start + 5);
+    } else {
+      return;
+    }
     card.start = Math.round(start * 10) / 10;
     card.end = Math.round(end * 10) / 10;
   });
