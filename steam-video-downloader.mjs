@@ -2273,32 +2273,46 @@ function freeRanges(dur, used) {
   return segs;
 }
 
-// 从素材选取片段用于片头/片尾混剪：优先"未用"区间（不与正片画面重复）；
-// 若素材被正片（含循环补播）用尽，兜底从素材开头取——片尾回顾集锦本就该含正片画面。
+// 从素材池选取片段用于片头/片尾混剪：
+//   1) 优先各素材的"未用"区间（不与正片画面重复）；素材被正片用尽时兜底用整段素材；
+//   2) **轮转取材**：素材1 取一个镜头 → 素材2 取一个镜头 → … → 再回素材1，
+//      保证混剪由多个素材交替组成。旧实现会连续吃同一个素材（凑满才换下一个），
+//      结果片头看着"像没混剪"，这是本次修复的重点。
 // clips: [{path, s, e}] 顺序即混剪顺序
 function pickFreeClips(materialsUsed, targetDur, clipLen) {
   const clips = [];
   let acc = 0;
-  const take = (m, s, e) => {
-    while (s < e - 0.5 && acc < targetDur - 0.2) {
-      const avail = e - s;
-      let len = Math.min(clipLen, avail);
-      const need = targetDur - acc;
-      if (need > 0.5 && need < len) len = need;
-      if (len < 0.5) break;
-      clips.push({ path: m.path, s, e: s + len });
-      acc += len;
-      s += len;
-    }
-  };
+  const per = Math.max(0.8, Number(clipLen) || 2.5);
+  const queues = [];
   for (const m of materialsUsed) {
-    if (acc >= targetDur - 0.2) break;
-    for (const f of freeRanges(m.dur, m.used)) take(m, f.s, f.e);
+    const fr = freeRanges(m.dur, m.used);
+    const ranges = fr.length ? fr : [{ s: 0, e: m.dur }];
+    const parts = [];
+    for (const r of ranges) {
+      let pos = Math.max(0, r.s);
+      while (pos < r.e - 0.5) {
+        const len = Math.min(per, r.e - pos);
+        if (len < 0.5) break;
+        parts.push({ s: pos, e: pos + len });
+        pos += len;
+      }
+    }
+    if (parts.length) queues.push({ path: m.path, parts, idx: 0 });
   }
-  if (acc < targetDur - 0.2) {
-    for (const m of materialsUsed) {
+  let progressed = true;
+  while (acc < targetDur - 0.2 && progressed) {
+    progressed = false;
+    for (const q of queues) {
       if (acc >= targetDur - 0.2) break;
-      take(m, 0, m.dur);
+      if (q.idx >= q.parts.length) continue;
+      const p = q.parts[q.idx++];
+      const need = targetDur - acc;
+      let len = p.e - p.s;
+      if (need > 0.5 && need < len) len = need; // 末段补精确到目标时长
+      if (len < 0.5) continue;
+      clips.push({ path: q.path, s: p.s, e: p.s + len });
+      acc += len;
+      progressed = true;
     }
   }
   return { clips, acc };
@@ -2445,13 +2459,38 @@ async function handleComposeTimeline(req, res) {
     // 2) 计划段序列（时长）
     const headVoicePath = hasHead ? String(voices[0].path || '') : '';
     if (hasHead && !fs.existsSync(headVoicePath)) throw new Error(`开场白配音不存在：${headVoicePath}`);
-    const headDur = hasHead ? (await voiceDurationOf(headVoicePath)) + 1 : 0;
+    const headVoiceDur = hasHead ? await voiceDurationOf(headVoicePath) : 0;
+    // 开场混剪时长：headSeconds > 0 时用它（可长于开场白，画面继续混剪；短于配音则自动延长，避免截断配音）；
+    // 留空/0 = 跟随开场白配音时长 + 1 秒余量。
+    const headSecCfg = Math.max(0, Number(payload.headSeconds) || 0);
+    let headDur = 0;
+    if (hasHead) {
+      if (headSecCfg > 0) {
+        headDur = Math.max(headSecCfg, headVoiceDur + 0.2);
+        if (headSecCfg < headVoiceDur + 0.2) {
+          warnings.push(`开场混剪填的 ${headSecCfg}s 比开场白配音（${headVoiceDur.toFixed(1)}s）还短，已自动延长到 ${headDur.toFixed(1)}s，否则开场白会被切掉`);
+        }
+      } else {
+        headDur = headVoiceDur + 1;
+      }
+    }
     if (hasHead) {
       const hs = parseSrtDuration(headVoicePath.replace(/\.[^.]+$/, '') + '.srt');
-      const hv = headDur - 1;
-      if (hs !== null && hs > hv + 1.5) {
-        warnings.push(`片头开场白的字幕时长 ${hs.toFixed(1)}s 超过配音 ${hv.toFixed(1)}s，字幕文件可能不对（建议用该段正确文案重新生成字幕）`);
+      if (hs !== null && hs > headVoiceDur + 1.5) {
+        warnings.push(`片头开场白的字幕时长 ${hs.toFixed(1)}s 超过配音 ${headVoiceDur.toFixed(1)}s，字幕文件可能不对（建议用该段正确文案重新生成字幕）`);
       }
+    }
+    // 片头/片尾混剪素材池 = 正片用到的素材 + 额外素材（页面上没配给任何段落的素材也能参与混剪）
+    const montagePool = materialsUsed.slice();
+    const extraMats = Array.isArray(payload.extraMaterials) ? payload.extraMaterials : [];
+    for (const p of extraMats) {
+      const mp = String(p || '').trim();
+      if (!mp || !fs.existsSync(mp)) continue;
+      if (montagePool.some((m) => m.path === mp)) continue;
+      try {
+        const dur = await runFfDuration(mp);
+        montagePool.push({ path: mp, dur, used: [] });
+      } catch { /* 读不了时长就跳过该素材 */ }
     }
     const tailDur = tailSeconds;
     const tableDur = games.length ? tableSeconds : 0;
@@ -2466,16 +2505,16 @@ async function handleComposeTimeline(req, res) {
     // 3) 生成片头/片尾混剪 与 片尾总表 画面文件
     const fileList = [];
     if (hasHead) {
-      const { clips, acc } = pickFreeClips(materialsUsed, headDur, 2.5);
-      if (acc < headDur - 1) throw new Error(`素材未用片段不足（凑到 ${acc.toFixed(1)}s / 需 ${headDur.toFixed(1)}s）：请提供更多/更长的素材`);
+      const { clips, acc } = pickFreeClips(montagePool, headDur, 2.5);
+      if (acc < headDur - 1) throw new Error(`片头混剪素材不足（凑到 ${acc.toFixed(1)}s / 需 ${headDur.toFixed(1)}s）：请提供更多/更长的素材，或把「开场混剪」时长调小`);
       const f = path.join(tmpDir, 'head.mp4');
       await renderMontage(clips, f);
       fileList.push(f);
     }
     segFiles.forEach((f) => fileList.push(f));
     if (tailDur > 0) {
-      const { clips, acc } = pickFreeClips(materialsUsed, tailDur, 2.5);
-      if (acc < tailDur - 1) throw new Error('素材未用片段不足以制作片尾混剪');
+      const { clips, acc } = pickFreeClips(montagePool, tailDur, 2.5);
+      if (acc < tailDur - 1) throw new Error('素材不足，无法制作片尾混剪（可把片尾时长调小或补充素材）');
       const f = path.join(tmpDir, 'tail.mp4');
       await renderMontage(clips, f);
       fileList.push(f);
@@ -2959,7 +2998,8 @@ https://store.steampowered.com/app/648800/Raft/"></textarea>
   <div class="sub" style="margin:0 0 8px">
     载入配音后，<strong>每一行 = 一段配音</strong>，顺序即成片播放顺序（<strong>按住行拖动</strong>或 ↑↓ 调整）。
     每段在「画面素材」下拉里<strong>自由连线</strong>你想配的视频素材（同一素材可重复配给多段）。
-    第 1 段勾选<strong>片头开场（混剪）</strong>后，画面自动取各素材未用片段拼成片头，其后各段 = 配音时长 + 余量。
+    第 1 段勾选<strong>片头开场（混剪）</strong>后，画面由<strong>各素材的镜头轮流拼接</strong>而成（素材1 一个镜头 → 素材2 一个镜头 → … 循环），
+    没配给任何段落的素材也会参与混剪；<strong>「开场混剪（秒）」可指定开场画面时长</strong>（留空 = 跟随开场白配音，填数字可更长，让开场多放几个游戏），
     若所选素材<strong>不够剪</strong>（时长不足覆盖配音），勾选<strong>不足循环补播</strong>会自动重复该段画面直到够；
     段间按<strong>转场</strong>秒数淡入淡出；末尾自动接片尾素材混剪 + 片尾省流总表（总表用游戏数据区结果）。
   </div>
@@ -2972,6 +3012,7 @@ https://store.steampowered.com/app/648800/Raft/"></textarea>
   <div id="autoPairInfo" class="warn"></div>
   <div id="autoRows"></div>
   <div class="row">
+    <label class="chk" title="开场（片头）混剪的画面时长：留空 = 跟随开场白配音时长（+1 秒）；填数字 = 固定这么长，可长于开场白，让开场多放几个游戏的镜头">开场混剪（秒）<input type="number" id="autoHeadSec" placeholder="跟随配音" min="0" max="180" step="0.5" style="width:80px" /></label>
     <label class="chk">画面余量（秒）<input type="number" id="autoPadding" value="2" min="0" max="30" style="width:60px" /></label>
     <label class="chk">段间转场（秒，0=硬切）<input type="number" id="autoTransition" value="0.5" min="0" max="5" step="0.1" style="width:60px" /></label>
     <label class="chk" title="把各段配音同名 .srt 字幕烧进画面（默认不烧，用剪映素材包导入更灵活）"><input type="checkbox" id="autoBurnSubs" /> 烧录字幕进画面</label>
@@ -4133,12 +4174,18 @@ autoGenBtn.addEventListener('click', function(){
       warnTxt = '（游戏数据 ' + gd.rows.length + ' 行 ≠ 素材段 ' + materials.length + ' 段，本次不渲染总表/卡片）';
     }
   }
+  // 开场混剪可以用"没配给任何段落的素材"一起剪（用户素材多于段落时特别有用）
+  var usedMatIdx = {};
+  autoVoices.forEach(function(v){ if (!v.isHead && v.matSel >= 0) usedMatIdx[v.matSel] = 1; });
+  var extraMats = autoMats.filter(function(m, i){ return !usedMatIdx[i]; }).map(function(m){ return m.path; });
   var payload = {
     materials: materials,
     voices: voices,
     games: games,
     padding: Number(autoPaddingInput.value) || 2,
     transition: Number(document.getElementById('autoTransition').value) || 0,
+    headSeconds: Number((document.getElementById('autoHeadSec') || {}).value) || 0,
+    extraMaterials: extraMats,
     burnSubs: !!(document.getElementById('autoBurnSubs') && document.getElementById('autoBurnSubs').checked),
     outDir: autoOutDirInput.value.trim(),
     outName: autoOutNameInput.value.trim()
