@@ -1459,18 +1459,47 @@ function listXlsxSheets(buf) {
   const zip = unzipEntries(buf);
   const wb = (zip['xl/workbook.xml'] || Buffer.alloc(0)).toString('utf8');
   const rels = (zip['xl/_rels/workbook.xml.rels'] || Buffer.alloc(0)).toString('utf8');
+  // 属性顺序无关地取 Id/Target：不同生成器（Excel / WPS / openpyxl）
+  // 写 rels 的属性顺序不同，旧正则要求 Id 在 Target 前，导致部分文件解析出 0 个工作表。
   const relMap = {};
-  const relRe = /Id="(rId\d+)"[^>]*Target="([^"]*)"/g;
   let m;
-  while ((m = relRe.exec(rels))) relMap[m[1]] = m[2];
-  const sheets = [];
-  const sheetRe = /<sheet[^>]*name="([^"]*)"[^>]*r:id="(rId\d+)"[^>]*\/?>/g;
-  while ((m = sheetRe.exec(wb))) {
-    const target = relMap[m[2]] || '';
-    if (target) sheets.push({ name: m[1], path: target.startsWith('/') ? target.slice(1) : `xl/${target.replace(/^\//, '')}`.replace(/^xl\/xl\//, 'xl/') });
+  const relRe = /<Relationship\b[^>]*>/g;
+  while ((m = relRe.exec(rels))) {
+    const id = /Id="([^"]+)"/.exec(m[0]);
+    const target = /Target="([^"]*)"/.exec(m[0]);
+    if (id && target) relMap[id[1]] = target[1];
   }
-  // 简化路径归一
-  return sheets.map((s) => ({ ...s, path: s.path.replace(/^xl\/xl\//, 'xl/') }));
+  const sheets = [];
+  const sheetRe = /<sheet\b[^>]*\/?>/g;
+  while ((m = sheetRe.exec(wb))) {
+    const nm = /name="([^"]*)"/.exec(m[0]);
+    const rid = /r:id="([^"]+)"/.exec(m[0]);
+    if (!nm || !rid) continue;
+    let target = relMap[rid[1]] || '';
+    if (!target) continue;
+    if (target.startsWith('/')) target = target.slice(1);
+    else target = `xl/${target.replace(/^\.\//, '')}`;
+    target = target.replace(/^xl\/xl\//, 'xl/');
+    sheets.push({ name: nm[1], path: target });
+  }
+  return sheets;
+}
+
+// 解码 xlsx 单元格里的 XML 实体：数字实体 &#35299; / &#x89e3; 以及 &amp; &lt; &gt; &quot; &apos;
+// （部分生成器——如 openpyxl、某些 WPS 版本——会把中文写成数字实体，不解码就会得到 "&#35299;&#35868;"）
+function decodeXmlEntities(s) {
+  return String(s == null ? '' : s)
+    .replace(/&#x([0-9a-fA-F]+);/g, (_, h) => {
+      try { return String.fromCodePoint(parseInt(h, 16)); } catch { return ''; }
+    })
+    .replace(/&#(\d+);/g, (_, d) => {
+      try { return String.fromCodePoint(Number(d)); } catch { return ''; }
+    })
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&amp;/g, '&');
 }
 
 // 读取某个 sheet，返回二维数组（表头行 + 数据行），单元格保留原始文本。
@@ -1485,7 +1514,7 @@ function readXlsxSheet(buf, sheetPath) {
     const p = /<t[^>]*>(.*?)<\/t>/gs;
     let tm;
     while ((tm = p.exec(mm[1]))) txt += tm[1];
-    ss.push(txt);
+    ss.push(decodeXmlEntities(txt));
   }
   const xml = (zip[sheetPath] || Buffer.alloc(0)).toString('utf8');
   const rowRe = /<row[^>]*>(.*?)<\/row>/gs; // 捕获组(.*?) = 行内 XML
@@ -1515,7 +1544,7 @@ function readXlsxSheet(buf, sheetPath) {
       else if (a.t === 'inlineStr' && iM) val = iM[1];
       else if (a.t === 'str' && vM) val = vM[1];
       else if (vM) val = vM[1];
-      rowCells.push({ col: colMatch[1], val });
+      rowCells.push({ col: colMatch[1], val: decodeXmlEntities(val) });
     }
     rowCells.sort((a, b) => a.col.length !== b.col.length ? a.col.length - b.col.length : (a.col < b.col ? -1 : 1));
     const row = rowCells.map((c) => c.val.trim());
@@ -1532,7 +1561,7 @@ const EXCEL_COL_MAP = [
   { key: 'rating', names: ['好评率', 'rating', '评价'] },
   { key: 'discount', names: ['折扣力度', '折扣档', 'discount'] },
   { key: 'deadline', names: ['截止日期', '折扣截止', 'deadline', 'date'] },
-  { key: 'tag1', names: ['标签1', 'tag1', '标签'] },
+  { key: 'tag1', names: ['标签1', '标签', 'tag1', 'tag', '热门标签'] },
   { key: 'tag2', names: ['标签2', 'tag2'] },
 ];
 
@@ -1563,6 +1592,8 @@ function mapExcelGrid(grid) {
       obj[def.key] = (cells[idx] !== undefined ? String(cells[idx]) : '').trim();
     }
     if (!obj.name && !obj.price && !obj.now) continue; // 无有效内容
+    // 标签统一成一个字段（表格里分"标签1/标签2"两列时合并），卡片与表格都只用一个标签框
+    obj.tag = [obj.tag1, obj.tag2].filter(Boolean).join(' ');
     // 保留原始全部列（key价格/语言等额外字段，供卡片渲染扩展）
     const raw = {};
     headers.forEach((h, i) => {
@@ -1951,8 +1982,10 @@ function buildCardLines(c) {
   if (c.discount) priceBits.push(String(c.discount));
   if (c.deadline) priceBits.push(`截止${c.deadline}`);
   if (priceBits.length) lines.push({ text: priceBits.join(' '), fs: 1, color: '#C0392B' });
-  const tags = [String(c.tag1 || '').trim(), String(c.tag2 || '').trim()].filter(Boolean);
-  if (tags.length) lines.push({ text: `标签：${tags.join(' ')}`, fs: 1, color: '#444444' });
+  // 标签：统一用一个字段（tag），兼容旧的 tag1/tag2 两列写法
+  const tagStr = [String(c.tag || '').trim(), String(c.tag1 || '').trim(), String(c.tag2 || '').trim()]
+    .filter(Boolean).join(' ');
+  if (tagStr) lines.push({ text: `标签：${tagStr}`, fs: 1, color: '#444444' });
   const rating = fmtRating(c.rating);
   if (rating) lines.push({ text: `好评率：${rating}`, fs: 1, color: '#333333' });
   const extra = probeExtra(c.raw);
@@ -2005,7 +2038,7 @@ function buildCardFilters(card, startSec, endSec) {
 }
 
 // POST /api/cards-overlay ：把多张游戏卡片按时间窗口叠加到视频左上角。
-// body: { video, cards: [{start,end,name,price,now,discount,deadline,rating,tag1,tag2,raw?}], outDir, outName? }
+// body: { video, cards: [{start,end,name,price,now,discount,deadline,rating,tag,raw?}], outDir, outName? }
 async function handleCardsOverlay(req, res) {
   let payload;
   try {
@@ -2184,14 +2217,14 @@ async function handleSteamCards(req, res) {
       ]);
       const gens = (data.genres || []).map((g) => g.description).filter(Boolean);
       const cats = (data.categories || []).map((c) => c.description).filter(Boolean);
-      // 标签：优先中文热门标签（前2）；中文不足时用官方类型(中文)补足；仍不足才退回原始标签
+      // 标签：优先中文热门标签（前 3 个，放在同一个标签框里）；中文不足时用官方类型(中文)补足；仍不足才退回原始标签
       const zh = extras.tags.filter((t) => /[\u4e00-\u9fff]/.test(String(t)));
       const zhg = gens.filter((g) => !zh.includes(g));
-      const tagSrc = zh.length >= 2
+      const tagSrc = zh.length >= 3
         ? zh
         : zh.concat(zhg).concat(extras.tags).filter((v, i, a) => v && a.indexOf(v) === i);
-      const tag1 = tagSrc[0] || '';
-      const tag2 = tagSrc[1] || '';
+      const tagList = tagSrc.slice(0, 3);
+      const tag = tagList.join(' ');
       const price = po ? String((po.initial || 0) / 100) : '';
       const now = po ? String((po.final || 0) / 100) : '';
       const discount = po && po.discount_percent ? `-${po.discount_percent}%` : '';
@@ -2204,8 +2237,9 @@ async function handleSteamCards(req, res) {
         discount: discount || '',
         deadline: extras.deadline || '',
         keyPrice: keyPrice || '',
-        tag1,
-        tag2,
+        tag,
+        tag1: tagList[0] || '',
+        tag2: tagList[1] || '',
         raw: null,
         source: 'steam',
       });
@@ -2963,8 +2997,9 @@ https://store.steampowered.com/app/648800/Raft/"></textarea>
   <div class="sub" style="margin:0 0 8px">
     数据来源二选一：<b>Excel 表格</b> 或 <b>Steam 链接直抓</b>（从商店接口自动取价格/折扣/好评率/标签/截止日期，无需表格）。
     解析结果供"游戏卡片 / 片尾总表"使用。<br>
-    <b>所有字段都能人工校正</b>：表格里 <b>游戏名 / 原价 / 现价 / 好评率 / 折扣 / 截止 / 标签1 / 标签2 / Key价</b> 都能直接改，
-    改完点 <b>「✔ 确定修改」</b> 才生效（改了不点确定，去成片 / 卡片时会提醒你）；不改就直接用抓取到的值，无需任何操作。
+    <b>所有字段都能人工校正</b>：表格里 <b>游戏名 / 原价 / 现价 / 好评率 / 折扣 / 截止 / 标签 / Key价</b> 都能直接改（标签只用一个框，可放多个），
+    改完点 <b>「✔ 确定修改」</b> 才生效（改了不点确定，去成片 / 卡片时会提醒你）；不改就直接用抓取到的值，无需任何操作。<br>
+    <b>顺序可调</b>：每行开头的 <b>↑ ↓</b> 可以对调顺序 —— 这里的顺序就是卡片 / 片尾总表对应各段的顺序（抓取顺序和实际视频顺序不一致时用它纠正）。
     Key 价来自 SteamPY 实时市场，最常需要校正。
   </div>
   <div class="row">
@@ -3562,7 +3597,7 @@ function loadExcelPreview() {
     .then(function(res){
       if (res.error) { eStatus('解析失败'); excelInfoEl.innerHTML = '<div class="errmsg">' + esc(res.error) + '</div>'; return; }
       window.__excelData = { file: lastExcelFile, sheet: res.sheet, cols: res.cols, rows: res.rows, total: res.total };
-      var colNames = { name: '游戏名', price: '原价', now: '现价', rating: '好评率', discount: '折扣力度', deadline: '截止日期', tag1: '标签1', tag2: '标签2' };
+      var colNames = { name: '游戏名', price: '原价', now: '现价', rating: '好评率', discount: '折扣力度', deadline: '截止日期', tag1: '标签', tag2: '标签' };
       var mapped = Object.keys(colNames).filter(function(k){ return res.cols[k] !== undefined; }).map(function(k){ return colNames[k] + '←列' + (res.cols[k] + 1); });
       excelInfoEl.innerHTML = '<div class="meta" style="margin-top:6px">✅ 工作表「' + esc(res.sheet) + '」共解析 <b>' + res.total + '</b> 行' + (mapped.length ? '　字段映射：' + esc(mapped.join('，')) : '') + '</div>';
       eStatus('解析完成 ✓');
@@ -3810,8 +3845,7 @@ var DATA_COLS = [
   { f: 'rating', label: '好评率', w: 66, tip: '好评率：可填 0.95 或 95%' },
   { f: 'discount', label: '折扣', w: 62, tip: '折扣力度，如 -50%' },
   { f: 'deadline', label: '截止', w: 96, tip: '折扣截止日期' },
-  { f: 'tag1', label: '标签1', w: 96, tip: '热门标签（卡片显示）' },
-  { f: 'tag2', label: '标签2', w: 96, tip: '第二个标签（可留空）' },
+  { f: 'tag', label: '标签', w: 210, tip: '热门标签，可以放多个（空格分隔）；Steam 抓取会取前 3 个放进这一个框' },
   { f: 'keyPrice', label: 'Key价', w: 66, tip: 'SteamPY 的 Key 价是实时市场价，可能不准，可手改' },
 ];
 
@@ -3821,16 +3855,19 @@ function dataCellInput(rowIdx, field, value, width, tip) {
     + (tip ? ' title="' + esc(tip) + '"' : '') + ' />';
 }
 
-// 统一的数据表格（所有字段可编辑）+ 底部「确定 / 撤销」工具栏
+// 统一的数据表格（所有字段可编辑 + 行顺序可调）+ 底部「确定 / 撤销」工具栏
 function renderDataTable(rows) {
   var th = 'border:1px solid #888;padding:4px 8px;background:rgba(127,127,127,.15)';
   var td = 'border:1px solid #888;padding:3px 8px';
-  var html = '<table style="border-collapse:collapse;font-size:12px;margin-top:8px;width:100%"><tr>'
-    + '<th style="' + th + '">#</th>';
+  var html = '<div id="dataTableBox"><table style="border-collapse:collapse;font-size:12px;margin-top:8px;width:100%"><tr>'
+    + '<th style="' + th + '" title="用 ↑↓ 调整顺序：卡片与片尾总表按这里的顺序对应各段">顺序</th>';
   DATA_COLS.forEach(function(c){ html += '<th style="' + th + '" title="' + esc(c.tip) + '">' + c.label + '</th>'; });
   html += '</tr>';
   rows.forEach(function(r, i){
-    html += '<tr><td style="' + td + '">' + (i + 1) + '</td>';
+    html += '<tr><td style="' + td + ';white-space:nowrap">' + (i + 1)
+      + ' <button class="ghost" style="padding:1px 5px;font-size:11px" onclick="moveDataRow(' + i + ',-1)" title="上移（卡片/总表按这里的顺序对应段落）">↑</button>'
+      + '<button class="ghost" style="padding:1px 5px;font-size:11px" onclick="moveDataRow(' + i + ',1)" title="下移">↓</button>'
+      + '</td>';
     DATA_COLS.forEach(function(c){
       html += '<td style="' + td + '">' + dataCellInput(i, c.f, r[c.f], c.w, c.tip) + '</td>';
     });
@@ -3841,8 +3878,26 @@ function renderDataTable(rows) {
     + '<button id="kpApply" class="accent" style="padding:6px 14px;font-size:13px">✔ 确定修改</button>'
     + '<button id="kpRevert" class="ghost">↩ 撤销修改</button>'
     + '<span id="kpStatus" class="meta" style="margin:0"></span>'
-    + '</div>';
+    + '</div></div>';
   return html;
+}
+
+// 调整数据行顺序：游戏顺序 = 卡片 / 片尾总表对应各段的顺序
+function moveDataRow(i, d) {
+  var gd = window.__excelData;
+  if (!gd || !gd.rows) return;
+  var j = i + d;
+  if (j < 0 || j >= gd.rows.length) return;
+  if (kpDirty) kpApplyChanges(); // 先把未确定的修改应用掉，避免顺序与编辑内容错位
+  var t = gd.rows[i];
+  gd.rows[i] = gd.rows[j];
+  gd.rows[j] = t;
+  var box = document.getElementById('dataTableBox');
+  if (box) box.outerHTML = renderDataTable(gd.rows);
+  kpPending = {};
+  kpDirty = false;
+  kpBind();
+  kpSetStatus('已把第 ' + (i + 1) + ' 行与第 ' + (j + 1) + ' 行对调（卡片 / 总表按新顺序对应各段）');
 }
 
 function kpSetStatus(t) {
@@ -4169,7 +4224,7 @@ autoGenBtn.addEventListener('click', function(){
   var warnTxt = '';
   if (gd && gd.rows && gd.rows.length) {
     if (gd.rows.length === materials.length) {
-      games = gd.rows.map(function(r){ return { name: r.name, price: r.price, now: r.now, rating: r.rating, discount: r.discount, deadline: r.deadline, keyPrice: r.keyPrice || '', tag1: r.tag1, tag2: r.tag2 }; });
+      games = gd.rows.map(function(r){ return { name: r.name, price: r.price, now: r.now, rating: r.rating, discount: r.discount, deadline: r.deadline, keyPrice: r.keyPrice || '', tag: r.tag || '' }; });
     } else {
       warnTxt = '（游戏数据 ' + gd.rows.length + ' 行 ≠ 素材段 ' + materials.length + ' 段，本次不渲染总表/卡片）';
     }
@@ -4224,7 +4279,7 @@ var cardRowsEl = document.getElementById('cardRows');
 var cardStatusEl = document.getElementById('cardStatus');
 var cardResultEl = document.getElementById('cardResult');
 var cardGenBtn = document.getElementById('cardGen');
-var cardList = []; // { name, price, now, rating, discount, deadline, tag1, tag2, raw, start, end }
+var cardList = []; // { name, price, now, rating, discount, deadline, tag, keyPrice, raw, start, end }
 window.__autoResult = null;
 
 function cStatus2(t) { cardStatusEl.textContent = t || ''; }
@@ -4233,7 +4288,7 @@ document.getElementById('cardLoadExcel').addEventListener('click', function(){
   if (!kpGuard()) return; // Key 价改了没点「确定」时先拦下
   var d = window.__excelData;
   if (!d || !d.rows || !d.rows.length) { cStatus2('请先在「📊 Excel 游戏数据」解析工作表'); return; }
-  cardList = d.rows.map(function(r){ return { name: r.name, price: r.price, now: r.now, rating: r.rating, discount: r.discount, deadline: r.deadline, keyPrice: r.keyPrice || '', tag1: r.tag1, tag2: r.tag2, raw: r.raw || null, start: '', end: '' }; });
+  cardList = d.rows.map(function(r){ return { name: r.name, price: r.price, now: r.now, rating: r.rating, discount: r.discount, deadline: r.deadline, keyPrice: r.keyPrice || '', tag: r.tag || '', raw: r.raw || null, start: '', end: '' }; });
   renderCardRows();
   cStatus2('已载入 ' + cardList.length + ' 张卡片（来自 Excel）');
 });
@@ -4306,7 +4361,7 @@ cardGenBtn.addEventListener('click', function(){
   var cards = cardList.filter(function(c){
     return c.start !== '' && c.end !== '' && (c.name || c.price);
   }).map(function(c){
-    return { start: Number(c.start) || 0, end: Number(c.end) || 0, name: c.name, price: c.price, now: c.now, rating: c.rating, discount: c.discount, deadline: c.deadline, keyPrice: c.keyPrice || '', tag1: c.tag1, tag2: c.tag2, raw: c.raw };
+    return { start: Number(c.start) || 0, end: Number(c.end) || 0, name: c.name, price: c.price, now: c.now, rating: c.rating, discount: c.discount, deadline: c.deadline, keyPrice: c.keyPrice || '', tag: c.tag || '', raw: c.raw };
   });
   if (!cards.length) { cStatus2('没有可用的卡片（请填开始/结束时间）'); return; }
   cardGenBtn.disabled = true;
