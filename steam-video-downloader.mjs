@@ -2924,8 +2924,9 @@ https://store.steampowered.com/app/648800/Raft/"></textarea>
   <div class="sub" style="margin:0 0 8px">
     数据来源二选一：<b>Excel 表格</b> 或 <b>Steam 链接直抓</b>（从商店接口自动取价格/折扣/好评率/标签/截止日期，无需表格）。
     解析结果供"游戏卡片 / 片尾总表"使用。<br>
-    <b>Key 价可人工校正</b>：表格里「Key价(可改)」直接改，改完点 <b>「✔ 确定 Key 价修改」</b> 才生效（改了不点确定，去成片/卡片时会提醒你）；
-    不改就直接用抓取到的值，无需任何操作。
+    <b>所有字段都能人工校正</b>：表格里 <b>游戏名 / 原价 / 现价 / 好评率 / 折扣 / 截止 / 标签1 / 标签2 / Key价</b> 都能直接改，
+    改完点 <b>「✔ 确定修改」</b> 才生效（改了不点确定，去成片 / 卡片时会提醒你）；不改就直接用抓取到的值，无需任何操作。
+    Key 价来自 SteamPY 实时市场，最常需要校正。
   </div>
   <div class="row">
     <button id="srcExcelBtn" class="ghost">📊 Excel 上传</button>
@@ -3524,23 +3525,9 @@ function loadExcelPreview() {
       var mapped = Object.keys(colNames).filter(function(k){ return res.cols[k] !== undefined; }).map(function(k){ return colNames[k] + '←列' + (res.cols[k] + 1); });
       excelInfoEl.innerHTML = '<div class="meta" style="margin-top:6px">✅ 工作表「' + esc(res.sheet) + '」共解析 <b>' + res.total + '</b> 行' + (mapped.length ? '　字段映射：' + esc(mapped.join('，')) : '') + '</div>';
       eStatus('解析完成 ✓');
-      // 预览表（前 50 行，按映射字段展示）
+      // 预览表（全部字段可编辑，改完点「确定修改」）
       if (!res.rows.length) { excelPreviewEl.innerHTML = '<div class="empty">（无数据行）</div>'; return; }
-      var fOrder = ['name', 'price', 'now', 'rating', 'discount', 'deadline', 'tag1', 'tag2'];
-      var fLabels = { name: '游戏名', price: '原价', now: '现价', rating: '好评率', discount: '折扣力度', deadline: '截止日期', tag1: '标签1', tag2: '标签2' };
-      var html = '<table style="border-collapse:collapse;font-size:12px;margin-top:8px;width:100%"><tr><th style="border:1px solid #888;padding:4px 8px;background:rgba(127,127,127,.15)">#</th>';
-      fOrder.forEach(function(f){ html += '<th style="border:1px solid #888;padding:4px 8px;background:rgba(127,127,127,.15)">' + fLabels[f] + '</th>'; });
-      html += '<th style="border:1px solid #888;padding:4px 8px;background:rgba(127,127,127,.15)" title="来自表格的 key价格 列或 SteamPY 抓取；可直接修改">Key价(可改)</th>';
-      html += '</tr>';
-      res.rows.forEach(function(row, i){
-        html += '<tr><td style="border:1px solid #888;padding:3px 8px">' + (i + 1) + '</td>';
-        fOrder.forEach(function(f){ html += '<td style="border:1px solid #888;padding:3px 8px">' + esc(row[f] || '') + '</td>'; });
-        html += '<td style="border:1px solid #888;padding:3px 8px">' + kpInput(i, row.keyPrice) + '</td>';
-        html += '</tr>';
-      });
-      html += '</table>';
-      html += kpToolbar();
-      excelPreviewEl.innerHTML = html;
+      excelPreviewEl.innerHTML = renderDataTable(res.rows);
       kpPending = {};
       kpDirty = false;
       kpBind();
@@ -3768,83 +3755,125 @@ document.getElementById('steamFetch').addEventListener('click', function(){
     .catch(function(e){ btn.disabled = false; steamStatusEl.textContent = '抓取失败：' + e.message; });
 });
 
-// ===== Key 价人工校正（SteamPY 是实时市场价，可能不准，允许手动改）=====
-// 规则：表格里改了 Key 价 → 必须点「✔ 确定」才写入数据（供成片/卡片/总表使用）；
+// ===== 游戏数据人工校正（抓取/解析都可能不准：Key 价是实时市场价、折扣与好评率也可能变）=====
+// 规则：表格里任何字段都可以直接改 → 必须点「✔ 确定修改」才写入数据（供成片 / 卡片 / 总表使用）；
 //       不改就直接用抓取/解析到的值，无需任何操作。
-var kpPending = {};   // { 行下标: 输入框里的新值 }
+var kpPending = {};   // { "行下标:字段": 输入框里的新值 }
 var kpDirty = false;  // 是否有"改了但没确定"的值
 
-function kpInput(rowIdx, value) {
-  return '<input type="text" data-kp="' + rowIdx + '" value="' + esc(value || '') + '" placeholder="可改" '
-    + 'style="width:74px;min-width:0;padding:3px 6px;font-size:12px" '
-    + 'title="SteamPY 的 Key 价是实时市场价，可能不准；直接改这里，改完点下方「确定」" />';
+// 表格列定义（全部可编辑）：字段、表头、宽度、提示
+var DATA_COLS = [
+  { f: 'name', label: '游戏名', w: 150, tip: '游戏名（卡片与总表显示用）' },
+  { f: 'price', label: '原价', w: 66, tip: '原价，如 ¥98' },
+  { f: 'now', label: '现价', w: 66, tip: '现价，如 ¥49' },
+  { f: 'rating', label: '好评率', w: 66, tip: '好评率：可填 0.95 或 95%' },
+  { f: 'discount', label: '折扣', w: 62, tip: '折扣力度，如 -50%' },
+  { f: 'deadline', label: '截止', w: 96, tip: '折扣截止日期' },
+  { f: 'tag1', label: '标签1', w: 96, tip: '热门标签（卡片显示）' },
+  { f: 'tag2', label: '标签2', w: 96, tip: '第二个标签（可留空）' },
+  { f: 'keyPrice', label: 'Key价', w: 66, tip: 'SteamPY 的 Key 价是实时市场价，可能不准，可手改' },
+];
+
+function dataCellInput(rowIdx, field, value, width, tip) {
+  return '<input type="text" data-ei="' + rowIdx + '" data-ef="' + field + '" value="' + esc(value || '') + '" '
+    + 'style="width:' + (width || 76) + 'px;min-width:0;padding:3px 6px;font-size:12px"'
+    + (tip ? ' title="' + esc(tip) + '"' : '') + ' />';
 }
-function kpToolbar() {
-  return '<div class="row" style="margin-top:8px">'
-    + '<button id="kpApply" class="accent" style="padding:6px 14px;font-size:13px">✔ 确定 Key 价修改</button>'
+
+// 统一的数据表格（所有字段可编辑）+ 底部「确定 / 撤销」工具栏
+function renderDataTable(rows) {
+  var th = 'border:1px solid #888;padding:4px 8px;background:rgba(127,127,127,.15)';
+  var td = 'border:1px solid #888;padding:3px 8px';
+  var html = '<table style="border-collapse:collapse;font-size:12px;margin-top:8px;width:100%"><tr>'
+    + '<th style="' + th + '">#</th>';
+  DATA_COLS.forEach(function(c){ html += '<th style="' + th + '" title="' + esc(c.tip) + '">' + c.label + '</th>'; });
+  html += '</tr>';
+  rows.forEach(function(r, i){
+    html += '<tr><td style="' + td + '">' + (i + 1) + '</td>';
+    DATA_COLS.forEach(function(c){
+      html += '<td style="' + td + '">' + dataCellInput(i, c.f, r[c.f], c.w, c.tip) + '</td>';
+    });
+    html += '</tr>';
+  });
+  html += '</table>';
+  html += '<div class="row" style="margin-top:8px">'
+    + '<button id="kpApply" class="accent" style="padding:6px 14px;font-size:13px">✔ 确定修改</button>'
     + '<button id="kpRevert" class="ghost">↩ 撤销修改</button>'
     + '<span id="kpStatus" class="meta" style="margin:0"></span>'
     + '</div>';
+  return html;
 }
+
 function kpSetStatus(t) {
   var el = document.getElementById('kpStatus');
   if (el) el.textContent = t || '';
+}
+function kpMarkDirty(inp) {
+  kpDirty = true;
+  if (inp) { inp.style.borderColor = '#e37400'; inp.style.background = 'rgba(227,116,0,.08)'; }
+  kpSetStatus('⚠️ 有未确定的修改：点「确定修改」后才会用于成片 / 卡片 / 总表');
+}
+function kpClearMarks() {
+  excelPreviewEl.querySelectorAll('input[data-ei]').forEach(function(inp){
+    inp.style.borderColor = '';
+    inp.style.background = '';
+  });
 }
 function kpBind() {
   var apply = document.getElementById('kpApply');
   var revert = document.getElementById('kpRevert');
   if (apply) apply.addEventListener('click', kpApplyChanges);
   if (revert) revert.addEventListener('click', kpRevertChanges);
-  excelPreviewEl.querySelectorAll('input[data-kp]').forEach(function(inp){
+  excelPreviewEl.querySelectorAll('input[data-ei]').forEach(function(inp){
     inp.addEventListener('input', function(){
-      kpPending[Number(inp.getAttribute('data-kp'))] = inp.value;
-      kpDirty = true;
-      inp.style.borderColor = '#e37400';
-      inp.style.background = 'rgba(227,116,0,.08)';
-      kpSetStatus('⚠️ 有未确定的 Key 价修改：点「确定」后才会用于成片 / 卡片 / 总表');
+      kpPending[inp.getAttribute('data-ei') + ':' + inp.getAttribute('data-ef')] = inp.value;
+      kpMarkDirty(inp);
     });
   });
   kpSetStatus(kpDirty
-    ? '⚠️ 有未确定的 Key 价修改：点「确定」后才会用于成片 / 卡片 / 总表'
-    : 'Key 价可直接在表格里改；改完点「确定」，不改就直接用当前值。');
+    ? '⚠️ 有未确定的修改：点「确定修改」后才会用于成片 / 卡片 / 总表'
+    : '表格里所有字段都能直接改（游戏名 / 价格 / 好评率 / 折扣 / 截止 / 标签 / Key价）；改完点「确定修改」，不改就直接用当前值。');
 }
 function kpApplyChanges() {
   var gd = window.__excelData;
   if (!gd || !gd.rows) { kpSetStatus('没有可应用的数据'); return; }
   var n = 0;
   Object.keys(kpPending).forEach(function(k){
-    var i = Number(k);
-    if (gd.rows[i] && String(gd.rows[i].keyPrice || '') !== String(kpPending[k] || '')) {
-      gd.rows[i].keyPrice = String(kpPending[k] || '').trim();
+    var parts = k.split(':');
+    var i = Number(parts[0]);
+    var f = parts[1];
+    var row = gd.rows[i];
+    if (!row || !f) return;
+    var nv = String(kpPending[k] == null ? '' : kpPending[k]).trim();
+    if (String(row[f] == null ? '' : row[f]) !== nv) {
+      row[f] = nv;
       n++;
     }
   });
   kpPending = {};
   kpDirty = false;
-  excelPreviewEl.querySelectorAll('input[data-kp]').forEach(function(inp){
-    inp.style.borderColor = '';
-    inp.style.background = '';
-  });
-  kpSetStatus(n ? ('✅ 已确定 ' + n + ' 处 Key 价修改，可用于成片 / 卡片 / 总表') : '没有检测到变化（数据保持原值）');
+  kpClearMarks();
+  kpSetStatus(n ? ('✅ 已确定 ' + n + ' 处修改，可用于成片 / 卡片 / 总表') : '没有检测到变化（数据保持原值）');
 }
 function kpRevertChanges() {
   var gd = window.__excelData;
   kpPending = {};
   kpDirty = false;
   if (gd && gd.rows) {
-    excelPreviewEl.querySelectorAll('input[data-kp]').forEach(function(inp){
-      var i = Number(inp.getAttribute('data-kp'));
-      inp.value = (gd.rows[i] && gd.rows[i].keyPrice) ? gd.rows[i].keyPrice : '';
-      inp.style.borderColor = '';
-      inp.style.background = '';
+    excelPreviewEl.querySelectorAll('input[data-ei]').forEach(function(inp){
+      var i = Number(inp.getAttribute('data-ei'));
+      var f = inp.getAttribute('data-ef');
+      var v = (gd.rows[i] && gd.rows[i][f] != null) ? gd.rows[i][f] : '';
+      inp.value = v;
     });
   }
+  kpClearMarks();
   kpSetStatus('已撤销修改（恢复为抓取 / 解析到的值）');
 }
 // 下游（成片 / 卡片 / 总表）使用数据前的守卫：改了却未点「确定」时挡一下
 function kpGuard() {
   if (!kpDirty) return true;
-  window.alert('你在「📊 游戏数据」里改了 Key 价但还没点「确定」。\n\n请先回到「📊 游戏数据」卡片点「✔ 确定 Key 价修改」（或点「↩ 撤销修改」），再继续这一步。');
+  window.alert('你在「📊 游戏数据」里改了内容但还没点「确定修改」。\n\n请先回到「📊 游戏数据」卡片点「✔ 确定修改」（或点「↩ 撤销修改」），再继续这一步。');
   return false;
 }
 
@@ -3856,26 +3885,13 @@ function renderSteamRows(rows) {
     bad.forEach(function(r){ html += '<div class="errmsg">appid ' + esc(r.appid) + '：' + esc(r.error) + '</div>'; });
   }
   if (good.length) {
-    html += '<table style="border-collapse:collapse;font-size:12px;margin-top:8px;width:100%"><tr><th style="border:1px solid #888;padding:4px 8px;background:rgba(127,127,127,.15)">#</th><th style="border:1px solid #888;padding:4px 8px;background:rgba(127,127,127,.15)">游戏名</th><th style="border:1px solid #888;padding:4px 8px;background:rgba(127,127,127,.15)">原/现</th><th style="border:1px solid #888;padding:4px 8px;background:rgba(127,127,127,.15)">折扣</th><th style="border:1px solid #888;padding:4px 8px;background:rgba(127,127,127,.15)">好评率</th><th style="border:1px solid #888;padding:4px 8px;background:rgba(127,127,127,.15)">截止</th><th style="border:1px solid #888;padding:4px 8px;background:rgba(127,127,127,.15)">Key价</th><th style="border:1px solid #888;padding:4px 8px;background:rgba(127,127,127,.15)">标签</th></tr>';
-    good.forEach(function(r, i) {
-      var rating = r.rating ? (Number(r.rating) <= 1 ? (Number(r.rating) * 100).toFixed(0) + '%' : r.rating) : '-';
-      html += '<tr><td style="border:1px solid #888;padding:3px 8px">' + (i + 1) + '</td>';
-      html += '<td style="border:1px solid #888;padding:3px 8px">' + esc(r.name) + '</td>';
-      html += '<td style="border:1px solid #888;padding:3px 8px">' + esc([r.price, r.now].filter(Boolean).join(' → ')) + '</td>';
-      html += '<td style="border:1px solid #888;padding:3px 8px">' + esc(r.discount || '-') + '</td>';
-      html += '<td style="border:1px solid #888;padding:3px 8px">' + esc(rating) + '</td>';
-      html += '<td style="border:1px solid #888;padding:3px 8px">' + esc(r.deadline || '-') + '</td>';
-      html += '<td style="border:1px solid #888;padding:3px 8px">' + kpInput(i, r.keyPrice) + '</td>';
-      html += '<td style="border:1px solid #888;padding:3px 8px">' + esc([r.tag1, r.tag2].filter(Boolean).join(' ')) + '</td></tr>';
-    });
-    html += '</table>';
-    html += kpToolbar();
+    html += renderDataTable(good);
   }
   excelPreviewEl.innerHTML = html;
   kpPending = {};
   kpDirty = false;
   if (good.length) kpBind();
-  excelInfoEl.innerHTML = '<div class="meta" style="margin-top:6px">✅ 已抓取 ' + good.length + ' 条游戏数据（顺序=链接顺序）。可到「🃏 游戏卡片叠加」载入使用</div>';
+  excelInfoEl.innerHTML = '<div class="meta" style="margin-top:6px">✅ 已抓取 ' + good.length + ' 条游戏数据（顺序=链接顺序）。表格里所有字段都能直接改，改完点「确定修改」；可到「🃏 游戏卡片叠加」载入使用</div>';
 }
 
 // ===== 自动贴合成片（A4） =====
