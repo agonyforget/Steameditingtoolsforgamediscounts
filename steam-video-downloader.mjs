@@ -1284,9 +1284,12 @@ async function runWhisperAsr(wavPath) {
 }
 
 // 把文案句子按顺序映射到 whisper 时间轴上（匀速朗读假设 + 就近吸附段边界）。
-// 返回 [{ text, start, end }]。
-function alignScriptToSegments(sentences, segments) {
-  const totalDur = segments.length ? segments[segments.length - 1].end : 0;
+// maxDur：该段配音的实测时长（秒）——字幕时间轴不得超过它，否则会出现
+// "字幕飘到没有声音的地方 / 一堆字幕挤在音频尾部"的现象。返回 [{ text, start, end }]。
+function alignScriptToSegments(sentences, segments, maxDur) {
+  const whisperEnd = segments.length ? segments[segments.length - 1].end : 0;
+  const limit = (maxDur && maxDur > 0) ? maxDur : whisperEnd;
+  const totalDur = Math.min(whisperEnd > 0 ? whisperEnd : limit, limit || whisperEnd);
   const norm = (s) => normText(s).length || 1;
   const lens = sentences.map(norm);
   const totalLen = lens.reduce((a, b) => a + b, 0);
@@ -1306,6 +1309,7 @@ function alignScriptToSegments(sentences, segments) {
     }
     let end = segIdx < segments.length ? segments[segIdx].start : (segments.length ? segments[segments.length - 1].end : lastEnd);
     end = Math.max(end, start + 0.3);
+    if (limit > 0) end = Math.min(end, Math.max(limit, start + 0.2)); // 不越过配音结尾
     out.push({ text: sentences[i], start: Math.round(start * 100) / 100, end: Math.round(end * 100) / 100 });
     lastEnd = end;
   }
@@ -1340,6 +1344,24 @@ async function handleSubtitleGenerate(req, res) {
   if (!ff) return json(res, 500, { error: '未找到 ffmpeg' });
   const sentences = splitScriptSentences(script);
   if (!sentences.length) return json(res, 400, { error: '文案为空或无法分句' });
+  // 配音实测时长（字幕时间轴不得超过它）+ 文案/配音匹配校验：
+  // 常见误用是把「整篇文案」粘到某一段配音上，结果几十句被硬塞进几秒音频、
+  // 字幕挤成一团（每句 0.2s）并飘到没有声音的地方。这里提前拦下并说明原因。
+  let audioDur = 0;
+  try { audioDur = await runFfDuration(voicePath); } catch { /* ignore */ }
+  const totalChars = sentences.reduce((a, s) => a + (normText(s).length || 0), 0);
+  if (audioDur > 0 && totalChars > 0) {
+    const cps = totalChars / audioDur;
+    // 正常中文解说 4~10 字/秒（快节奏口播可到 10）；超过 12 字/秒基本可断定是
+    // "整篇文案粘到了单段配音上"（实测误用案例：1106 字塞进 7.3 秒 ≈ 151 字/秒）。
+    if (cps > 12) {
+      return json(res, 400, {
+        error: `文案与配音时长不匹配：这段配音实测只有 ${audioDur.toFixed(1)} 秒，而文案有 ${totalChars} 字`
+          + `（按正常解说语速约需 ${Math.round(totalChars / 5)} 秒）。请只粘贴「这一段配音」对应的文案；`
+          + `若是整篇文案，请按段拆分后分别生成字幕。`,
+      });
+    }
+  }
   try {
     fs.mkdirSync(outDir, { recursive: true });
   } catch (e) {
@@ -1354,8 +1376,8 @@ async function handleSubtitleGenerate(req, res) {
     await runLocal(ff, ['-y', '-loglevel', 'error', '-i', voicePath, '-ar', '16000', '-ac', '1', '-c:a', 'pcm_s16le', wav], { timeoutMs: 120000 });
     // 2) whisper 识别（带句级时间戳）
     const segments = await runWhisperAsr(wav);
-    // 3) 文案句子 ↔ 时间轴对齐
-    const cues = alignScriptToSegments(sentences, segments);
+    // 3) 文案句子 ↔ 时间轴对齐（以配音实测时长封顶）
+    const cues = alignScriptToSegments(sentences, segments, audioDur);
     // 4) 生成并保存 srt（与配音同名，存到 outDir）
     const srtText = buildSrt(cues);
     const srtFile = path.join(outDir, voiceName.replace(/\.[^.]+$/, '') + '.srt');
@@ -1668,12 +1690,19 @@ function parseSrtCues(srtPath) {
   return out;
 }
 
-// 配音时长：优先同目录同名 .srt（用户 B1 产物），否则实测音频时长。
+// 配音时长：以**音频实测时长**为准（画面段长 = 配音时长 + 余量，必须跟声音一致）。
+// 只有音频无法解析时才回退同名 .srt 的末条时间——旧实现优先用 srt，
+// 一旦 srt 与音频不符（例如文案粘错导致 srt 被拉长到 16s、音频只有 7s），
+// 段落就会凭空变长，表现为"开场白播完画面还停留十几秒、各段余量不一致"。
 async function voiceDurationOf(voicePath) {
-  const srt = voicePath.replace(/\.[^.]+$/, '') + '.srt';
-  const fromSrt = parseSrtDuration(srt);
-  if (fromSrt !== null) return fromSrt;
-  return runFfDuration(voicePath);
+  try {
+    return await runFfDuration(voicePath);
+  } catch {
+    const srt = voicePath.replace(/\.[^.]+$/, '') + '.srt';
+    const fromSrt = parseSrtDuration(srt);
+    if (fromSrt !== null) return fromSrt;
+    throw new Error(`无法读取配音时长：${path.basename(voicePath)}`);
+  }
 }
 
 // POST /api/compose-auto ：素材↔配音按顺序配对自动成片（支持段间淡入淡出转场）。
@@ -1835,9 +1864,17 @@ function resolveCnFont(bold) {
   return null;
 }
 
-// filter 值转义：反斜杠/冒号/百分号/单引号（ffmpeg 滤镜参数层 av_opt 的转义；% 用 \% 转义）
+// filter 值转义：值会被单引号包裹，故按"值层"转义 反斜杠/冒号/百分号。
+// 单引号必须用 '\'' 断引号技巧——直接写 \' 会提前结束引用，
+// 使后续滤镜的 enable 时间被当成滤镜名（ffmpeg 报 No such filter: '17.900'）；
+// 文本里的换行/制表符会破坏滤镜串，统一替换为空格。
 function escF(v) {
-  return String(v ?? '').replace(/\\/g, '\\\\').replace(/:/g, '\\:').replace(/%/g, '\\%').replace(/'/g, "\\'");
+  return String(v ?? '')
+    .replace(/[\r\n\t]+/g, ' ')
+    .replace(/\\/g, '\\\\')
+    .replace(/:/g, '\\:')
+    .replace(/%/g, '\\%')
+    .replace(/'/g, "'\\''");
 }
 
 // 好评率显示：0.95 → 95.00%；83 → 83.00%；带 % 原样
@@ -2336,6 +2373,7 @@ async function handleComposeTimeline(req, res) {
 
   try {
     const k = materials.length;
+    const warnings = []; // 非致命提示（如字幕文件与配音不匹配），随结果返回给页面
     // 1) 各正片段配音时长与段长
     const segDurs = [];
     const segFiles = [];
@@ -2349,6 +2387,14 @@ async function handleComposeTimeline(req, res) {
       const loop = materials[i].loop !== false; // 默认开启：素材不够剪时循环补播直到覆盖配音
       const tVoice = await voiceDurationOf(voice);
       const segLen = tVoice + padding;
+      // 字幕健康检查：同名 .srt 明显长于配音通常意味着"文案粘错/字幕生成有误"，
+      // 烧录或导入剪映时会飘到没有声音的地方，这里提前警告。
+      {
+        const srtDur = parseSrtDuration(voice.replace(/\.[^.]+$/, '') + '.srt');
+        if (srtDur !== null && srtDur > tVoice + 1.5) {
+          warnings.push(`第 ${i + 1} 段配音的字幕时长 ${srtDur.toFixed(1)}s 超过配音 ${tVoice.toFixed(1)}s，字幕文件可能不对（建议用该段正确文案重新生成字幕）`);
+        }
+      }
       const clip = path.join(tmpDir, `seg${i}.mp4`);
       const cutInfo = await clipSegment(ff, mat, start, segLen, loop, i + 1, clip);
       segFiles.push(clip);
@@ -2362,6 +2408,13 @@ async function handleComposeTimeline(req, res) {
     const headVoicePath = hasHead ? String(voices[0].path || '') : '';
     if (hasHead && !fs.existsSync(headVoicePath)) throw new Error(`开场白配音不存在：${headVoicePath}`);
     const headDur = hasHead ? (await voiceDurationOf(headVoicePath)) + 1 : 0;
+    if (hasHead) {
+      const hs = parseSrtDuration(headVoicePath.replace(/\.[^.]+$/, '') + '.srt');
+      const hv = headDur - 1;
+      if (hs !== null && hs > hv + 1.5) {
+        warnings.push(`片头开场白的字幕时长 ${hs.toFixed(1)}s 超过配音 ${hv.toFixed(1)}s，字幕文件可能不对（建议用该段正确文案重新生成字幕）`);
+      }
+    }
     const tailDur = tailSeconds;
     const tableDur = games.length ? tableSeconds : 0;
     const durs = []; // 段序列时长
@@ -2403,7 +2456,13 @@ async function handleComposeTimeline(req, res) {
     const firstVid = fileList[0];
     const { w: baseW, h: baseH } = await probeVideoSize(firstVid);
     const fc = [];
-    fileList.forEach((_, i) => fc.push(`[${i}:v]fps=${fps},${scaleFilterTo(baseW, baseH)},format=yuv420p[v${i}]`));
+    // 每段精确到计划时长 durs[i]：流拷贝剪辑会按关键帧对齐、实际可能长出一大截，
+    // 一旦某段偏长，画面就比配音久（表现为"某段余量特别大、后段整体后移"）。
+    // 先 tpad 复制末帧兜底（不足时补），再 trim 到计划值（超出时裁），保证时间轴严格对齐。
+    fileList.forEach((_, i) => {
+      const target = Math.max(0.1, Number(durs[i]) || 0).toFixed(3);
+      fc.push(`[${i}:v]fps=${fps},${scaleFilterTo(baseW, baseH)},tpad=stop_mode=clone:stop_duration=3,trim=duration=${target},setpts=PTS-STARTPTS,format=yuv420p[v${i}]`);
+    });
     if (transition > 0 && nSeg > 1) {
       const accOf = (p) => durs.slice(0, p).reduce((a, b) => a + b, 0);
       let prev = 'v0';
@@ -2568,7 +2627,14 @@ async function handleComposeTimeline(req, res) {
           if (!fs.existsSync(srtPath)) continue;
           const win = windows.find((w) => w.label === p.label);
           const off = win ? win.startMs / 1000 : 0;
-          for (const c of parseSrtCues(srtPath)) merged.push({ start: c.start + off, end: c.end + off, text: c.text });
+          // 只保留落在本段窗口内的字幕：异常 srt（比配音长）不会溢到后续段落
+          const winEnd = win ? win.endMs / 1000 : Infinity;
+          for (const c of parseSrtCues(srtPath)) {
+            const s = c.start + off;
+            const e = Math.min(c.end + off, winEnd);
+            if (s >= winEnd || e <= s) continue;
+            merged.push({ start: s, end: e, text: c.text });
+          }
         }
         merged.sort((a, b) => a.start - b.start);
         if (merged.length) {
@@ -2606,6 +2672,7 @@ async function handleComposeTimeline(req, res) {
       hasHead,
       windows,
       segments: windows,
+      warnings,
     });
   } catch (e) {
     let tmpList = '';
@@ -3599,10 +3666,12 @@ function loadAutoVoices() {
 document.getElementById('autoLoadMat').addEventListener('click', loadAutoMats);
 document.getElementById('autoLoadVoice').addEventListener('click', loadAutoVoices);
 
-// 载入后：推断片头（01 配音且比素材多 1）、为没配过素材的解说段补默认素材（第 j 段 → 素材 j）
+// 载入后：推断片头、为没配过素材的解说段补默认素材（第 j 段 → 素材 j）
 function syncAutoConfig() {
-  if (autoVoices.length && autoMats.length && !autoVoices[0].isHead
-      && autoVoices.length === autoMats.length + 1 && looksLikeHead(autoVoices[0].name)) {
+  // 片头识别只看第 1 段配音的名字，不再要求"配音数 = 素材数 + 1"：
+  // 素材比配音多时（例如素材 8 个、配音 6 段）旧条件不成立，01 开场白会被当成普通段，
+  // 于是卡片时间从开场白那一段开始算（就是"片头被算进游戏段"的原因）。
+  if (autoVoices.length >= 2 && autoVoices[0] && !autoVoices[0].isHead && looksLikeHead(autoVoices[0].name)) {
     autoVoices[0].isHead = true;
   }
   var j = 0;
@@ -3804,6 +3873,9 @@ autoGenBtn.addEventListener('click', function(){
       var html = '<div class="meta" style="color:#1a7a3a;margin-top:6px">✅ 完整成片已生成：<b>' + esc(res.output) + '</b>（' + formatSizeClient(res.size) + '，总时长约 ' + Math.round(res.duration) + ' 秒' + (games.length ? '，含省流总表 ' + games.length + ' 款游戏' : '') + '）</div>';
       (res.windows || []).forEach(function(w){
         html += '<div class="meta">' + esc(w.label) + '：' + Math.round(w.startMs / 1000) + 's → ' + Math.round(w.endMs / 1000) + 's</div>';
+      });
+      (res.warnings || []).forEach(function(w){
+        html += '<div class="errmsg" style="color:#b06000">⚠️ ' + esc(w) + '</div>';
       });
       autoResultEl.innerHTML = html;
     })
