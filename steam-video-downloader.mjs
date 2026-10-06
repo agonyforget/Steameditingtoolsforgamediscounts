@@ -1283,13 +1283,18 @@ async function runWhisperAsr(wavPath) {
   return segments;
 }
 
-// 把文案句子按顺序映射到 whisper 时间轴上（匀速朗读假设 + 就近吸附段边界）。
-// maxDur：该段配音的实测时长（秒）——字幕时间轴不得超过它，否则会出现
-// "字幕飘到没有声音的地方 / 一堆字幕挤在音频尾部"的现象。返回 [{ text, start, end }]。
+// 把文案句子按顺序映射到语音识别的时间轴上（匀速朗读假设 + 就近吸附段边界）。
+// maxDur：该段配音的实测时长（秒）。两种常见偏差都在这里兜住：
+//   1) 识别时间轴比配音长 → 字幕不得超出配音（clamp 到 audioDur）；
+//   2) 识别只覆盖配音前半（音量低/有背景音导致漏识别）→ 时间轴明显短于配音时按比例
+//      拉伸铺满整段配音，否则字幕会全挤在前半、后半没字幕。
+// 返回 [{ text, start, end }]。
 function alignScriptToSegments(sentences, segments, maxDur) {
   const whisperEnd = segments.length ? segments[segments.length - 1].end : 0;
-  const limit = (maxDur && maxDur > 0) ? maxDur : whisperEnd;
-  const totalDur = Math.min(whisperEnd > 0 ? whisperEnd : limit, limit || whisperEnd);
+  const audioDur = (maxDur && maxDur > 0) ? maxDur : whisperEnd;
+  const base = whisperEnd > 0 ? whisperEnd : audioDur;
+  const totalDur = (audioDur > 0 ? Math.min(base, audioDur) : base);
+  const stretch = (whisperEnd > 0 && audioDur > whisperEnd + 2) ? (audioDur / whisperEnd) : 1;
   const norm = (s) => normText(s).length || 1;
   const lens = sentences.map(norm);
   const totalLen = lens.reduce((a, b) => a + b, 0);
@@ -1301,7 +1306,7 @@ function alignScriptToSegments(sentences, segments, maxDur) {
     const start = segIdx < segments.length ? segments[segIdx].start : lastEnd;
     let acc = 0;
     let guard = 0;
-    // 分配 whisper 段给本句：累计段时长达到期望即停（避免抢下句的段）
+    // 分配识别段给本句：累计段时长达到期望即停（避免抢下句的段）
     while (segIdx < segments.length && acc < expDur * 0.85 && guard++ < segments.length) {
       const segStart = Math.max(segments[segIdx].start, start);
       acc += Math.max(0, segments[segIdx].end - segStart);
@@ -1309,9 +1314,13 @@ function alignScriptToSegments(sentences, segments, maxDur) {
     }
     let end = segIdx < segments.length ? segments[segIdx].start : (segments.length ? segments[segments.length - 1].end : lastEnd);
     end = Math.max(end, start + 0.3);
-    if (limit > 0) end = Math.min(end, Math.max(limit, start + 0.2)); // 不越过配音结尾
-    out.push({ text: sentences[i], start: Math.round(start * 100) / 100, end: Math.round(end * 100) / 100 });
     lastEnd = end;
+    // 拉伸铺满 + 不越过配音结尾（末条至少保留 0.2s 显示）
+    const cap = audioDur > 0 ? audioDur : Infinity;
+    const s2 = Math.min(start * stretch, cap);
+    let e2 = Math.min(end * stretch, Math.max(cap, s2 + 0.2));
+    if (e2 <= s2) e2 = Math.min(s2 + 0.2, cap === Infinity ? s2 + 0.2 : Math.max(cap, s2 + 0.2));
+    out.push({ text: sentences[i], start: Math.round(s2 * 100) / 100, end: Math.round(e2 * 100) / 100 });
   }
   return out;
 }
@@ -1376,18 +1385,47 @@ async function handleSubtitleGenerate(req, res) {
     await runLocal(ff, ['-y', '-loglevel', 'error', '-i', voicePath, '-ar', '16000', '-ac', '1', '-c:a', 'pcm_s16le', wav], { timeoutMs: 120000 });
     // 2) whisper 识别（带句级时间戳）
     const segments = await runWhisperAsr(wav);
-    // 3) 文案句子 ↔ 时间轴对齐（以配音实测时长封顶）
+    // 3) 文案句子 ↔ 时间轴对齐（以配音实测时长封顶；识别覆盖不全时按比例铺满）
     const cues = alignScriptToSegments(sentences, segments, audioDur);
+    const warnings = [];
+    const whisperEnd = segments.length ? segments[segments.length - 1].end : 0;
+    if (audioDur > 0 && whisperEnd > 0 && audioDur > whisperEnd + 2) {
+      warnings.push(`语音识别只覆盖了配音的前 ${Math.round((whisperEnd / audioDur) * 100)}%（配音 ${audioDur.toFixed(1)}s / 识别到 ${whisperEnd.toFixed(1)}s），`
+        + `字幕已按语速均匀铺满整段；若发现明显错位，可检查这段配音是否有背景音或音量偏低。`);
+    }
     // 4) 生成并保存 srt（与配音同名，存到 outDir）
     const srtText = buildSrt(cues);
     const srtFile = path.join(outDir, voiceName.replace(/\.[^.]+$/, '') + '.srt');
     fs.writeFileSync(srtFile, srtText, 'utf8');
-    return json(res, 200, { ok: true, srtFile, srt: srtText, cues });
+    return json(res, 200, { ok: true, srtFile, srt: srtText, cues, warnings, audioDur });
   } catch (e) {
     return json(res, 502, { error: `字幕生成失败：${e.message}` });
   } finally {
     try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch { /* ignore */ }
   }
+}
+
+// POST /api/subtitle/split ：把整篇文案拆成"句子列表 + 空行分块"，
+// 供「一键给全部配音生成字幕」使用（空行块正好对应各段配音时最准确）。
+async function handleSubtitleSplit(req, res) {
+  let payload;
+  try {
+    payload = JSON.parse(await readBody(req));
+  } catch {
+    return json(res, 400, { error: '请求体不是合法 JSON' });
+  }
+  const script = String(payload.script || '').trim();
+  if (!script) return json(res, 400, { error: '请粘贴文案内容' });
+  const sentences = splitScriptSentences(script);
+  if (!sentences.length) return json(res, 400, { error: '文案为空或无法分句' });
+  // 空行分块（连续空行视为一个分隔）
+  const blocks = script.split(/\r?\n\s*\r?\n+/).map((b) => splitScriptSentences(b)).filter((b) => b.length);
+  return json(res, 200, {
+    sentences,
+    blocks,
+    totalChars: sentences.reduce((a, s) => a + (normText(s).length || 0), 0),
+    chars: sentences.map((s) => normText(s).length || 0),
+  });
 }
 
 // ── Excel 读取（A3：零依赖 .xlsx 解析 + 上传预览）────────────────────────────
@@ -2869,6 +2907,16 @@ https://store.steampowered.com/app/648800/Raft/"></textarea>
     <span id="subStatus"></span>
   </div>
   <div id="subResult"></div>
+  <div class="row" style="margin-top:12px;border-top:1px dashed rgba(127,127,127,.35);padding-top:12px">
+    <button id="subGenAll" class="accent">⚡ 一键给全部配音生成字幕（整篇文案）</button>
+    <span id="subAllStatus"></span>
+  </div>
+  <div class="sub" style="margin:4px 0 0">
+    把<strong>整篇文案</strong>粘在上面（或点「载入文案文件」）再点这个按钮即可：
+    程序会先按<strong>空行分段</strong>分配（空行段数 = 配音段数时最准），
+    段数不一致时按各段配音<strong>时长比例</strong>自动切分，然后逐段识别、分别生成同名 .srt。
+  </div>
+  <div id="subAllResult"></div>
 </div>
 
 <div class="card">
@@ -3268,6 +3316,7 @@ subGenBtn.addEventListener('click', function(){
       lastSrt = res.srt;
       subStatus('完成 ✓');
       var html = '<div class="meta" style="color:#1a7a3a;margin-top:6px">✅ 字幕已保存：<b>' + esc(res.srtFile) + '</b>（共 ' + res.cues.length + ' 句）</div>';
+      (res.warnings || []).forEach(function(w){ html += '<div class="errmsg" style="color:#b06000">⚠️ ' + esc(w) + '</div>'; });
       html += '<pre style="white-space:pre-wrap;max-height:260px;overflow:auto">' + esc(res.srt) + '</pre>';
       subResultEl.innerHTML = html;
       subCopyBtn.style.display = 'inline-block';
@@ -3282,6 +3331,135 @@ subCopyBtn.addEventListener('click', function(){
   } else {
     window.prompt('请手动复制（Ctrl+C）：', lastSrt);
   }
+});
+
+// ===== 一键给全部配音生成字幕（整篇文案自动分段）=====
+var subGenAllBtn = document.getElementById('subGenAll');
+var subAllStatusEl = document.getElementById('subAllStatus');
+var subAllResultEl = document.getElementById('subAllResult');
+function subAllStatus(t) { if (subAllStatusEl) subAllStatusEl.textContent = t || ''; }
+
+// 把整篇文案分配到各段配音：
+// 1) 空行分块数 === 配音段数 → 一一对应（按段写文案时最准）
+// 2) 否则按各段配音时长比例，用字数累加切分句子
+function assignScriptToVoices(split, voices) {
+  var groups = voices.map(function(v){ return { voice: v, sentences: [] }; });
+  var blocks = (split && split.blocks) || [];
+  if (blocks.length === voices.length) {
+    blocks.forEach(function(b, i){ groups[i].sentences = b.slice(); });
+    return { groups: groups, mode: 'blocks' };
+  }
+  var sentences = (split && split.sentences) || [];
+  var durs = voices.map(function(v){ return Math.max(0.1, Number(v.dur) || 0); });
+  var totalDur = durs.reduce(function(a, b){ return a + b; }, 0) || 1;
+  var totalChars = Number(split && split.totalChars) || sentences.reduce(function(a, s){ return a + s.length; }, 0) || 1;
+  var idx = 0;
+  for (var i = 0; i < voices.length; i++) {
+    var want = totalChars * (durs[i] / totalDur);
+    var got = 0;
+    var isLast = (i === voices.length - 1);
+    while (idx < sentences.length) {
+      var sLen = sentences[idx].length;
+      if (!isLast && got > 0 && got + sLen > want * 1.15) break;
+      groups[i].sentences.push(sentences[idx]);
+      got += sLen;
+      idx++;
+      if (!isLast && got >= want) break;
+    }
+  }
+  while (idx < sentences.length) { groups[groups.length - 1].sentences.push(sentences[idx]); idx++; }
+  return { groups: groups, mode: 'ratio' };
+}
+
+function renderSubAllResults(results, mode, voices) {
+  var okCount = results.filter(function(r){ return r.ok; }).length;
+  var html = '<div class="meta" style="margin-top:8px">'
+    + (mode === 'blocks'
+        ? '按空行分段：文案 ' + results.length + ' 段 ↔ 配音 ' + voices.length + ' 段一一对应'
+        : '文案空行段数与配音数不一致，已按各段配音时长比例切分')
+    + ' ｜ 成功 ' + okCount + '/' + results.length + ' 段</div>';
+  results.forEach(function(r){
+    if (r.ok) {
+      var last = (r.cues && r.cues.length) ? r.cues[r.cues.length - 1].end : 0;
+      html += '<div class="meta" style="color:#1a7a3a">✅ ' + esc(r.voice) + '：' + r.sentences + ' 句 / ' + r.chars + ' 字 → '
+        + '字幕 0 ~ ' + last + 's（配音 ' + (Number(r.dur) || 0).toFixed(1) + 's）</div>';
+      (r.warnings || []).forEach(function(w){
+        html += '<div class="errmsg" style="color:#b06000">⚠️ ' + esc(r.voice) + '：' + esc(w) + '</div>';
+      });
+    } else {
+      html += '<div class="errmsg">❌ ' + esc(r.voice) + '：' + esc(r.error || '生成失败') + '</div>';
+    }
+  });
+  html += '<div class="meta">若某段失败，可单独在上方下拉选这一段、只粘它那段文案重新生成。</div>';
+  subAllResultEl.innerHTML = html;
+}
+
+subGenAllBtn.addEventListener('click', function(){
+  var script = subScriptEl.value.trim();
+  if (!script) { subAllStatus('请先粘贴整篇文案（或点「载入文案文件」）'); return; }
+  if (!voiceFiles.length) { subAllStatus('请先在「配音上传」里载入配音'); return; }
+  var voices = voiceFiles.slice();
+  subGenAllBtn.disabled = true;
+  subAllResultEl.innerHTML = '';
+  subAllStatus('正在拆分文案……');
+  fetch('/api/subtitle/split', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ script: script })
+  })
+    .then(function(r){ return r.json(); })
+    .then(function(res){
+      if (res.error) {
+        subGenAllBtn.disabled = false;
+        subAllStatus('拆分失败');
+        subAllResultEl.innerHTML = '<div class="errmsg">' + esc(res.error) + '</div>';
+        return;
+      }
+      var plan = assignScriptToVoices(res, voices);
+      var groups = plan.groups;
+      var results = [];
+      var i = 0;
+      var render = function(){ renderSubAllResults(results, plan.mode, voices); };
+      var next = function(){
+        if (i >= groups.length) {
+          subGenAllBtn.disabled = false;
+          var okN = results.filter(function(x){ return x.ok; }).length;
+          subAllStatus('全部处理完成：' + okN + '/' + groups.length + ' 段成功');
+          render();
+          return;
+        }
+        var g = groups[i];
+        var text = g.sentences.join('\n');
+        var chars = g.sentences.reduce(function(a, s){ return a + s.length; }, 0);
+        var dur = Math.max(0, Number(g.voice.dur) || 0);
+        if (!text) {
+          results.push({ voice: g.voice.name, ok: false, error: '这段没分到文案（可调整文案里的空行分段，使其与配音段数一致）', dur: dur });
+          i++; render(); next(); return;
+        }
+        subAllStatus('识别中：第 ' + (i + 1) + '/' + groups.length + ' 段 ' + g.voice.name + '（' + g.sentences.length + ' 句 / ' + chars + ' 字）……');
+        fetch('/api/subtitle/generate', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ voiceFile: g.voice.name, script: text, voiceDir: voiceDirVal(), outDir: document.getElementById('subOutDir').value.trim() })
+        })
+          .then(function(r){ return r.json(); })
+          .then(function(res2){
+            if (res2.error) results.push({ voice: g.voice.name, ok: false, error: res2.error, dur: dur });
+            else results.push({ voice: g.voice.name, ok: true, srtFile: res2.srtFile, cues: res2.cues, sentences: g.sentences.length, chars: chars, dur: dur, warnings: res2.warnings });
+            i++; render(); next();
+          })
+          .catch(function(e){
+            results.push({ voice: g.voice.name, ok: false, error: e.message, dur: dur });
+            i++; render(); next();
+          });
+      };
+      next();
+    })
+    .catch(function(e){
+      subGenAllBtn.disabled = false;
+      subAllStatus('拆分失败');
+      subAllResultEl.innerHTML = '<div class="errmsg">请求失败：' + esc(e.message) + '</div>';
+    });
 });
 
 // ===== Excel 游戏数据（A3） =====
@@ -4356,6 +4534,8 @@ function main() {
       handleVoiceDelete(urlObj, res);
     } else if (p === '/api/subtitle/generate' && req.method === 'POST') {
       handleSubtitleGenerate(req, res).catch((e) => json(res, 500, { error: e.message }));
+    } else if (p === '/api/subtitle/split' && req.method === 'POST') {
+      handleSubtitleSplit(req, res).catch((e) => json(res, 500, { error: e.message }));
     } else if (p === '/api/excel/upload') {
       handleExcelUpload(req, res, urlObj);
     } else if (p === '/api/excel/preview') {
