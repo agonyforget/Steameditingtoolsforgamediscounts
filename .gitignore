@@ -12,3 +12,6 @@ Logs/
 # Node
 node_modules/
 *.tgz
+
+# Office 打开文档时的临时锁文件
+~$*
